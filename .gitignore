@@ -1,0 +1,23 @@
+# Python bytecode and cache folders
+__pycache__/
+*.py[cod]
+
+# Virtual environments should stay local to your machine
+.venv/
+venv/
+env/
+
+# Local environment variable files may contain secrets
+.env
+.env.local
+
+# Streamlit local settings
+.streamlit/secrets.toml
+
+# Operating system files
+.DS_Store
+
+# Test and coverage output
+.pytest_cache/
+.coverage
+htmlcov/
