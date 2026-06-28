@@ -479,7 +479,7 @@ def show_replacement_value_by_position(
         projections_dataframe,
     )
 
-    st.header("Replacement Value by Position")
+    st.subheader("Replacement Value by Position")
     st.write(
         "This helps identify positions where your current roster has a real "
         "advantage versus positions that can be streamed from the waiver wire."
@@ -935,39 +935,31 @@ def show_lineup_impact(
         st.dataframe(changed_slots_df.round(3), width="stretch")
 
 
-st.title("Top Pickups")
-st.info(
-    "These rankings are based on sportsbook hitter props. They do not yet know "
-    "which players are available in your fantasy league."
-)
+st.title("Top Pickups Command Center")
 st.caption(
-    "Upload a CSV of your waiver wire or available players list to filter these "
-    "rankings to players you can actually add. The CSV must include a `player` "
-    "column."
+    "Start with the action plan, then use the detailed sections below to review "
+    "lineup impact, pickup options, and data quality."
 )
-st.caption(
-    "Upload a CSV with player and eligible_positions columns to filter "
-    "recommendations by roster need."
-)
-st.caption(
-    "You can also upload your current roster CSV to compare recommendations "
-    "against players you already have."
-)
-st.caption(
-    "If your active roster has fewer than 17 players, the app can recommend "
-    "add-only hitter pickups without forcing a drop."
-)
-st.caption(
-    "Fallback projections are lower confidence because they are based on "
-    "season stats and do not fully account for today's matchup, ballpark, "
-    "weather, or lineup spot."
-)
-st.caption(
-    "Download a template, fill it out with your league data, then upload it "
-    "back into the app."
-)
-st.markdown(
-    """
+
+
+# The action plan depends on projections calculated later, but this container
+# reserves its visual position near the top of the command center.
+action_plan_container = st.container()
+
+
+# Build templates with pandas so the generated CSVs always match the supported
+# upload columns.
+available_players_template = build_available_players_template()
+roster_template = build_roster_template()
+
+with st.expander("Uploads and Settings", expanded=True):
+    st.write(
+        "Upload your available-player list and current roster to turn the page "
+        "into a daily command center. Download the templates if you want the "
+        "supported columns."
+    )
+    st.markdown(
+        """
 CSV column guide:
 
 - `player` = player name
@@ -980,44 +972,39 @@ CSV column guide:
 - `keeper_status` = optional roster strategy label like `Core`, `Hold`, `Streamer`, or `Drop Candidate`
 - `notes` = optional context for your own review
 """
-)
-st.warning(
-    "LF, CF, RF, and DH are treated as exact positions. Do not enter OF unless "
-    "your league actually uses OF."
-)
-st.warning(
-    "If you leave droppable and undroppable blank, the app will use conservative "
-    "default logic."
-)
+    )
+    st.warning(
+        "LF, CF, RF, and DH are treated as exact positions. Do not enter OF "
+        "unless your league actually uses OF."
+    )
+    st.warning(
+        "If you leave droppable and undroppable blank, the app will use "
+        "conservative default logic."
+    )
 
+    template_columns = st.columns(2)
+    template_columns[0].download_button(
+        "Download available players CSV template",
+        data=available_players_template.to_csv(index=False),
+        file_name="available_players_template.csv",
+        mime="text/csv",
+    )
+    template_columns[1].download_button(
+        "Download roster CSV template",
+        data=roster_template.to_csv(index=False),
+        file_name="roster_template.csv",
+        mime="text/csv",
+    )
 
-# Build templates with pandas so the generated CSVs always match the supported
-# upload columns.
-available_players_template = build_available_players_template()
-roster_template = build_roster_template()
-
-st.download_button(
-    "Download available players CSV template",
-    data=available_players_template.to_csv(index=False),
-    file_name="available_players_template.csv",
-    mime="text/csv",
-)
-st.download_button(
-    "Download roster CSV template",
-    data=roster_template.to_csv(index=False),
-    file_name="roster_template.csv",
-    mime="text/csv",
-)
-
-
-uploaded_available_players = st.file_uploader(
-    "Upload available players CSV",
-    type=["csv"],
-)
-uploaded_roster = st.file_uploader(
-    "Upload your current roster CSV",
-    type=["csv"],
-)
+    upload_columns = st.columns(2)
+    uploaded_available_players = upload_columns[0].file_uploader(
+        "Upload available players CSV",
+        type=["csv"],
+    )
+    uploaded_roster = upload_columns[1].file_uploader(
+        "Upload your current roster CSV",
+        type=["csv"],
+    )
 
 
 @st.cache_data(ttl=60 * 60)
@@ -1067,18 +1054,6 @@ try:
         sp_start_context = show_weekly_sp_start_tracker()
         show_roster_flexibility_summary(roster_dataframe, sp_start_context)
 
-    if has_valid_roster_csv and show_roster_protection_review:
-        st.header("Roster Protection Review")
-        st.write(
-            "The optimizer will only suggest dropping players marked droppable. "
-            "If you leave droppable and undroppable blank, the app protects the "
-            "player by default."
-        )
-        st.dataframe(
-            build_roster_protection_review(roster_dataframe),
-            width="stretch",
-        )
-
     position_enrichment_dataframe = build_position_enrichment_dataframe(
         available_players_dataframe,
         roster_dataframe,
@@ -1112,24 +1087,42 @@ try:
         pickup_table = add_roster_metadata(pickup_table, roster_dataframe)
         master_pickup_table = pickup_table.copy()
 
-        if has_valid_roster_csv or has_valid_available_players_csv:
-            st.header("Projection Coverage Review")
-            st.write(
-                "This separates players with sportsbook-line projections from "
-                "players using lower-confidence stat-based fallback projections "
-                "or no usable projection."
-            )
-            st.dataframe(
-                build_projection_coverage_review(master_pickup_table).round(3),
-                width="stretch",
-            )
+        roster_projection_table = pd.DataFrame()
+        available_projection_table = pd.DataFrame()
+        pickup_recommendations = pd.DataFrame()
+        multi_add_scenarios = pd.DataFrame()
+        roster_summary = None
+        best_move = None
+
+        if has_valid_roster_csv:
+            roster_projection_table = master_pickup_table[
+                master_pickup_table["roster_status"] == "On My Roster"
+            ].copy()
+
+        if has_valid_available_players_csv:
+            available_projection_table = master_pickup_table[
+                master_pickup_table["roster_status"] == "Available"
+            ].copy()
 
         if has_valid_roster_csv and has_valid_available_players_csv:
-            show_replacement_value_by_position(
-                roster_dataframe,
-                available_players_dataframe,
-                master_pickup_table,
+            pickup_recommendations = evaluate_single_hitter_pickups(
+                roster_projection_table,
+                available_projection_table,
             )
+            roster_summary = get_roster_flexibility_summary(roster_projection_table)
+
+            if roster_summary["open_active_spots"] > 1:
+                multi_add_scenarios = evaluate_multi_add_hitter_scenarios(
+                    roster_projection_table,
+                    available_projection_table,
+                )
+
+            best_move = get_best_positive_move(
+                pickup_recommendations,
+                multi_add_scenarios,
+            )
+            with action_plan_container:
+                show_todays_action_plan(best_move)
 
         # If a CSV is uploaded, use it as an available-player filter.
         if has_valid_available_players_csv:
@@ -1145,13 +1138,13 @@ try:
 
         if has_valid_roster_csv:
             st.header("Best Current Hitter Lineup")
+            st.write(
+                "This is the best projected starting hitter lineup from your "
+                "uploaded roster before considering pickups."
+            )
 
             # Only optimize players from the uploaded current roster. Available
             # players are not used for this lineup feature.
-            roster_projection_table = master_pickup_table[
-                master_pickup_table["roster_status"] == "On My Roster"
-            ].copy()
-
             if roster_projection_table.empty:
                 st.info(
                     "No projected hitters matched your current roster CSV, so "
@@ -1208,28 +1201,11 @@ try:
                 )
 
         if has_valid_roster_csv and has_valid_available_players_csv:
-            st.header("Best One-Move Pickup Recommendations")
-
-            roster_projection_table = master_pickup_table[
-                master_pickup_table["roster_status"] == "On My Roster"
-            ].copy()
-            available_projection_table = master_pickup_table[
-                master_pickup_table["roster_status"] == "Available"
-            ].copy()
-
-            pickup_recommendations = evaluate_single_hitter_pickups(
-                roster_projection_table,
-                available_projection_table,
+            st.header("Pickup Recommendations")
+            st.write(
+                "Review no-drop options first, then compare add/drop moves that "
+                "may carry season-long roster risk."
             )
-            roster_summary = get_roster_flexibility_summary(roster_projection_table)
-            multi_add_scenarios = pd.DataFrame()
-
-            if roster_summary["open_active_spots"] > 1:
-                multi_add_scenarios = evaluate_multi_add_hitter_scenarios(
-                    roster_projection_table,
-                    available_projection_table,
-                )
-
             selected_min_gain = st.sidebar.slider(
                 "Minimum Projected Gain",
                 min_value=0.0,
@@ -1249,21 +1225,11 @@ try:
                     "active roster spots."
                 )
             else:
-                best_move = get_best_positive_move(
-                    pickup_recommendations,
-                    multi_add_scenarios,
-                )
-                show_todays_action_plan(best_move)
                 show_best_move_summary(best_move)
                 show_lineup_impact(
                     roster_projection_table,
                     available_projection_table,
                     best_move,
-                )
-                show_split_pickup_recommendations(
-                    pickup_recommendations,
-                    selected_min_gain,
-                    show_no_gain_moves,
                 )
 
                 if roster_summary["open_active_spots"] > 1:
@@ -1271,6 +1237,12 @@ try:
                         multi_add_scenarios,
                         show_no_gain_moves,
                     )
+
+                show_split_pickup_recommendations(
+                    pickup_recommendations,
+                    selected_min_gain,
+                    show_no_gain_moves,
+                )
 
         # Add the tier label after projection points are calculated.
         pickup_table["tier"] = pickup_table["projected_fantasy_points"].apply(
@@ -1343,7 +1315,44 @@ try:
             ascending=False,
         ).drop(columns=["normalized_player_name"], errors="ignore")
 
+        st.header("Ranked Available Hitters")
+        st.write(
+            "This table keeps the broader player rankings available after the "
+            "daily action plan and pickup recommendation sections."
+        )
         st.dataframe(pickup_table[TOP_PICKUPS_COLUMNS].round(3), width="stretch")
+
+        if has_valid_roster_csv and show_roster_protection_review:
+            with st.expander("Roster Protection Review"):
+                st.write(
+                    "The optimizer will only suggest dropping players marked "
+                    "droppable. If you leave droppable and undroppable blank, "
+                    "the app protects the player by default."
+                )
+                st.dataframe(
+                    build_roster_protection_review(roster_dataframe),
+                    width="stretch",
+                )
+
+        if has_valid_roster_csv or has_valid_available_players_csv:
+            with st.expander("Projection Coverage Review"):
+                st.write(
+                    "This separates players with sportsbook-line projections "
+                    "from players using lower-confidence stat-based fallback "
+                    "projections or no usable projection."
+                )
+                st.dataframe(
+                    build_projection_coverage_review(master_pickup_table).round(3),
+                    width="stretch",
+                )
+
+        if has_valid_roster_csv and has_valid_available_players_csv:
+            with st.expander("Replacement Value by Position"):
+                show_replacement_value_by_position(
+                    roster_dataframe,
+                    available_players_dataframe,
+                    master_pickup_table,
+                )
 except MissingOddsAPIKeyError as error:
     st.warning(str(error))
     st.write("Create a `.env` file and add your The Odds API key to load pickups.")
