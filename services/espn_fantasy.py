@@ -6,10 +6,13 @@ rest of the dashboard can treat it as an optional integration.
 """
 
 import os
+import re
 from urllib.parse import unquote
 
 import requests
 from dotenv import load_dotenv
+
+from utils.name_matching import build_player_match_key, normalize_player_name
 
 
 ESPN_BASE_URL = "https://fantasy.espn.com/apis/v3/games/flb"
@@ -24,6 +27,49 @@ ESPN_TEAM_ID_ENV = "ESPN_TEAM_ID"
 ESPN_SEASON_YEAR_ENV = "ESPN_SEASON_YEAR"
 ESPN_SWID_ENV = "ESPN_SWID"
 ESPN_S2_ENV = "ESPN_S2"
+ESPN_PLAYABLE_POSITIONS = {
+    "C",
+    "1B",
+    "2B",
+    "3B",
+    "SS",
+    "LF",
+    "CF",
+    "RF",
+    "DH",
+    "SP",
+    "RP",
+}
+ESPN_NON_PLAYABLE_SLOTS = {
+    "BE",
+    "BENCH",
+    "IL",
+    "INJURED LIST",
+    "UTIL",
+    "IF",
+    "OF",
+    "P",
+    "2B/SS",
+    "1B/3B",
+}
+ESPN_SLOT_ID_TO_LABEL = {
+    "0": "C",
+    "1": "1B",
+    "2": "2B",
+    "3": "3B",
+    "4": "SS",
+    "5": "OF",
+    "12": "UTIL",
+    "13": "P",
+    "14": "SP",
+    "15": "RP",
+    "16": "BE",
+    "17": "IL",
+    "20": "DH",
+    "21": "LF",
+    "22": "CF",
+    "23": "RF",
+}
 
 
 class ESPNFantasyError(Exception):
@@ -134,15 +180,45 @@ def get_my_espn_roster(league, team_id=None) -> list[dict]:
     ]
 
 
-def get_espn_free_agents(league, size: int = 100) -> list[dict]:
+def get_espn_free_agents(
+    league,
+    position: str | None = None,
+    size: int = 100,
+) -> list[dict]:
     """Return normalized free-agent rows from espn-api."""
 
     try:
-        free_agents = league.free_agents(size=size)
+        # espn-api handles the ESPN request for us. We ask for a limited
+        # number of players so this experimental page stays responsive.
+        free_agents = league.free_agents(size=size, position=position)
     except Exception as error:
-        raise ESPNFantasyError("espn-api could not load free agents.") from error
+        raise ESPNFantasyError(
+            "espn-api could not load free agents.",
+            debug_info={"error": repr(error), "position": position, "size": size},
+        ) from error
 
-    return [normalize_espn_player(player) for player in free_agents]
+    # Free agents are not on your fantasy roster, so we label their roster spot
+    # as Available before showing them in Streamlit.
+    return [
+        normalize_espn_player(player, roster_spot="Available")
+        for player in free_agents
+    ]
+
+
+def get_espn_free_agent_player_objects(
+    league,
+    position: str | None = None,
+    size: int = 100,
+) -> list:
+    """Return raw espn-api Player objects for temporary debugging."""
+
+    try:
+        return league.free_agents(size=size, position=position)
+    except Exception as error:
+        raise ESPNFantasyError(
+            "espn-api could not load raw free-agent player objects.",
+            debug_info={"error": repr(error), "position": position, "size": size},
+        ) from error
 
 
 def normalize_espn_player(
@@ -153,12 +229,18 @@ def normalize_espn_player(
     """Normalize an espn-api Player object for the rest of the dashboard."""
 
     eligible_positions = _get_player_eligible_positions(player)
+    player_name = _get_player_name(player)
+    normalized_roster_spot = _normalize_espn_slot_label(
+        roster_spot or _get_player_roster_spot(player)
+    )
 
     return {
-        "player": _get_player_name(player),
+        "player": player_name,
+        "normalized_player_name": normalize_player_name(player_name),
+        "player_match_key": build_player_match_key(player_name),
         "espn_player_id": _get_player_id(player),
-        "eligible_positions": ", ".join(eligible_positions),
-        "roster_spot": roster_spot,
+        "eligible_positions": ",".join(eligible_positions),
+        "roster_spot": normalized_roster_spot,
         "player_type": _infer_player_type_from_positions(eligible_positions),
         "pro_team": _get_first_existing_attribute(
             player,
@@ -170,6 +252,51 @@ def normalize_espn_player(
         ),
         "fantasy_team": fantasy_team or "",
     }
+
+
+def get_espn_player_position_debug(player) -> dict:
+    """Return safe position-related fields from an espn-api Player object.
+
+    ESPN player objects contain several fields that look like positions. Some
+    are true fantasy eligibility, while others are default MLB position,
+    current lineup slot, or broad ESPN lineup buckets. This debug helper makes
+    those fields visible while we confirm which one matches ESPN's UI.
+    """
+
+    raw_fields = getattr(player, "__dict__", {})
+    position_debug = {}
+    known_position_fields = [
+        "position",
+        "lineupSlot",
+        "eligibleSlots",
+        "eligible_slots",
+        "eligible_positions",
+        "positions",
+    ]
+
+    for field_name in known_position_fields:
+        if hasattr(player, field_name):
+            position_debug[field_name] = getattr(player, field_name)
+
+    for field_name, field_value in raw_fields.items():
+        lowered_name = field_name.lower()
+
+        if (
+            "position" in lowered_name
+            or "slot" in lowered_name
+            or field_name in {"lineupSlot", "eligibleSlots"}
+        ):
+            position_debug[field_name] = field_value
+
+    position_debug["eligibility_source_used"] = (
+        "eligibleSlots exact playable entries only"
+    )
+    position_debug["normalized_eligible_positions"] = ",".join(
+        _get_player_eligible_positions(player)
+    )
+    position_debug["normalized_roster_spot"] = _get_player_roster_spot(player)
+
+    return position_debug
 
 
 def build_espn_headers(
@@ -575,34 +702,100 @@ def _get_player_id(player):
 def _get_player_roster_spot(player) -> str:
     """Read roster spot or lineup slot from an espn-api Player object."""
 
-    return str(
+    roster_spot = str(
         _get_first_existing_attribute(
             player,
             ["lineupSlot", "lineup_slot", "slot_position"],
         )
     )
 
+    return _normalize_espn_slot_label(roster_spot)
+
 
 def _get_player_eligible_positions(player) -> list[str]:
-    """Read position eligibility from an espn-api Player object."""
+    """Read true playable position eligibility from an espn-api Player object.
 
-    for attribute_name in [
-        "eligible_positions",
-        "eligibleSlots",
-        "positions",
-        "position",
-    ]:
+    ESPN exposes both position eligibility and lineup/roster slots. They are
+    not the same thing. For example, BE means bench, IL means injured list, UTIL
+    means a lineup slot, and IF/OF/2B-SS/1B-3B are broad lineup buckets. We
+    exclude those from eligible_positions because this league requires exact
+    positions for optimizer decisions.
+
+    The espn-api field we use is eligibleSlots. We intentionally do not fall
+    back to position/default position because that is a player's primary MLB
+    position, not the full ESPN fantasy eligibility shown in the app.
+    """
+
+    raw_positions = []
+
+    for attribute_name in ["eligibleSlots", "eligible_slots"]:
         positions = getattr(player, attribute_name, None)
 
         if not positions:
             continue
 
         if isinstance(positions, list):
-            return [str(position) for position in positions]
+            raw_positions = [str(position) for position in positions]
+            break
 
-        return [str(positions)]
+        raw_positions = [str(positions)]
+        break
 
-    return []
+    return _normalize_eligible_positions(raw_positions)
+
+
+def _normalize_eligible_positions(raw_positions: list[str]) -> list[str]:
+    """Split and clean ESPN position values into exact position tokens.
+
+    ESPN or espn-api may return combined strings like "1B/3B". The dashboard
+    needs those stored as "1B,3B" so filters and exact eligibility checks do not
+    accidentally treat "1B/3B" as a fake position.
+    """
+
+    normalized_positions = []
+
+    for raw_position in raw_positions:
+        for position in re.split(r",", str(raw_position)):
+            cleaned_position = _normalize_espn_slot_label(position)
+
+            # Only keep true playable positions. Do not infer 1B from IF, do
+            # not infer LF/CF/RF from OF, do not infer anything from UTIL, and
+            # do not expand ESPN combo lineup slots like 2B/SS or 1B/3B.
+            if (
+                cleaned_position in ESPN_NON_PLAYABLE_SLOTS
+                or cleaned_position not in ESPN_PLAYABLE_POSITIONS
+            ):
+                continue
+
+            if cleaned_position not in normalized_positions:
+                normalized_positions.append(cleaned_position)
+
+    return normalized_positions
+
+
+def _normalize_espn_slot_label(value) -> str:
+    """Convert ESPN slot ids or labels into a readable uppercase label."""
+
+    if value is None:
+        return ""
+
+    raw_value = str(value).strip()
+
+    if raw_value.lower() == "available":
+        return "Available"
+
+    cleaned_value = raw_value.upper()
+
+    if cleaned_value in ESPN_SLOT_ID_TO_LABEL:
+        return ESPN_SLOT_ID_TO_LABEL[cleaned_value]
+
+    if cleaned_value == "BENCH":
+        return "BE"
+
+    if cleaned_value == "INJURED LIST":
+        return "IL"
+
+    return cleaned_value
 
 
 def _infer_player_type_from_positions(eligible_positions: list[str]) -> str:

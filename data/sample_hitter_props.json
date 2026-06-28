@@ -1,0 +1,70 @@
+{
+  "id": "sample_event_1",
+  "sport_key": "baseball_mlb",
+  "sport_title": "MLB",
+  "commence_time": "2026-06-28T23:05:00Z",
+  "home_team": "Los Angeles Dodgers",
+  "away_team": "San Diego Padres",
+  "bookmakers": [
+    {
+      "key": "sample_book",
+      "title": "Sample Sportsbook",
+      "markets": [
+        {
+          "key": "batter_hits",
+          "outcomes": [
+            {"name": "Over", "description": "Mookie Betts", "price": -135, "point": 0.5},
+            {"name": "Under", "description": "Mookie Betts", "price": 105, "point": 0.5},
+            {"name": "Over", "description": "Fernando Tatis Jr.", "price": -125, "point": 0.5},
+            {"name": "Under", "description": "Fernando Tatis Jr.", "price": -105, "point": 0.5}
+          ]
+        },
+        {
+          "key": "batter_home_runs",
+          "outcomes": [
+            {"name": "Over", "description": "Mookie Betts", "price": 420, "point": 0.5},
+            {"name": "Under", "description": "Mookie Betts", "price": -650, "point": 0.5},
+            {"name": "Over", "description": "Fernando Tatis Jr.", "price": 390, "point": 0.5},
+            {"name": "Under", "description": "Fernando Tatis Jr.", "price": -600, "point": 0.5}
+          ]
+        },
+        {
+          "key": "batter_rbis",
+          "outcomes": [
+            {"name": "Over", "description": "Mookie Betts", "price": 145, "point": 0.5},
+            {"name": "Under", "description": "Mookie Betts", "price": -175, "point": 0.5},
+            {"name": "Over", "description": "Fernando Tatis Jr.", "price": 155, "point": 0.5},
+            {"name": "Under", "description": "Fernando Tatis Jr.", "price": -185, "point": 0.5}
+          ]
+        },
+        {
+          "key": "batter_runs_scored",
+          "outcomes": [
+            {"name": "Over", "description": "Mookie Betts", "price": 105, "point": 0.5},
+            {"name": "Under", "description": "Mookie Betts", "price": -135, "point": 0.5},
+            {"name": "Over", "description": "Fernando Tatis Jr.", "price": 115, "point": 0.5},
+            {"name": "Under", "description": "Fernando Tatis Jr.", "price": -145, "point": 0.5}
+          ]
+        },
+        {
+          "key": "batter_total_bases",
+          "outcomes": [
+            {"name": "Over", "description": "Mookie Betts", "price": -110, "point": 1.5},
+            {"name": "Under", "description": "Mookie Betts", "price": -120, "point": 1.5},
+            {"name": "Over", "description": "Fernando Tatis Jr.", "price": -105, "point": 1.5},
+            {"name": "Under", "description": "Fernando Tatis Jr.", "price": -125, "point": 1.5}
+          ]
+        },
+        {
+          "key": "batter_stolen_bases",
+          "outcomes": [
+            {"name": "Over", "description": "Mookie Betts", "price": 650, "point": 0.5},
+            {"name": "Under", "description": "Mookie Betts", "price": -1100, "point": 0.5},
+            {"name": "Over", "description": "Fernando Tatis Jr.", "price": 425, "point": 0.5},
+            {"name": "Under", "description": "Fernando Tatis Jr.", "price": -700, "point": 0.5}
+          ]
+        }
+      ]
+    }
+  ]
+}

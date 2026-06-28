@@ -17,6 +17,8 @@ env/
 # Local caches created by pybaseball and matplotlib
 .pybaseball_cache/
 .matplotlib_cache/
+data/cache/*.json
+data/cache/**/*.json
 
 # Operating system files
 .DS_Store

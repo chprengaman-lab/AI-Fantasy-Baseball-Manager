@@ -1,0 +1,10 @@
+[
+  {
+    "id": "sample_event_1",
+    "sport_key": "baseball_mlb",
+    "sport_title": "MLB",
+    "commence_time": "2026-06-28T23:05:00Z",
+    "home_team": "Los Angeles Dodgers",
+    "away_team": "San Diego Padres"
+  }
+]

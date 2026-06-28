@@ -25,6 +25,7 @@ from services.lineup_optimizer import (
 )
 from services.player_projection_engine import build_player_projection_table
 from services.player_stats import normalize_player_name
+from utils.streamlit_debug import show_odds_api_error_debug
 
 
 TOP_PICKUPS_COLUMNS = [
@@ -1008,10 +1009,16 @@ CSV column guide:
 
 
 @st.cache_data(ttl=60 * 60)
-def load_cached_player_projection_table(availability_dataframe=None):
+def load_cached_player_projection_table(
+    availability_dataframe=None,
+    force_refresh_odds: bool = False,
+):
     """Build and cache the unified projection table for one hour."""
 
-    return build_player_projection_table(availability_dataframe)
+    return build_player_projection_table(
+        availability_dataframe,
+        force_refresh_odds=force_refresh_odds,
+    )
 
 
 try:
@@ -1021,6 +1028,11 @@ try:
     has_valid_roster_csv = False
     show_roster_protection_review = False
     sp_start_context = None
+    st.sidebar.warning("Live refresh may consume API credits.")
+    refresh_live_odds_data = st.sidebar.button("Refresh live odds data")
+
+    if refresh_live_odds_data:
+        load_cached_player_projection_table.clear()
 
     if uploaded_available_players is not None:
         available_players_dataframe = pd.read_csv(uploaded_available_players)
@@ -1059,11 +1071,22 @@ try:
         roster_dataframe,
     )
 
-    pickup_table = load_cached_player_projection_table(position_enrichment_dataframe)
+    pickup_table = load_cached_player_projection_table(
+        position_enrichment_dataframe,
+        refresh_live_odds_data,
+    )
+    odds_data_source = pickup_table.attrs.get("odds_data_source", {})
 
     if pickup_table.empty:
         st.info("No player projections are available right now.")
     else:
+        st.caption(
+            "Data source: "
+            f"events = {odds_data_source.get('events') or 'Unknown'}, "
+            "hitter props = "
+            f"{odds_data_source.get('hitter_props') or 'Unknown'}"
+        )
+
         pickup_table["normalized_player_name"] = pickup_table["player"].apply(
             normalize_player_name
         )
@@ -1358,3 +1381,4 @@ except MissingOddsAPIKeyError as error:
     st.write("Create a `.env` file and add your The Odds API key to load pickups.")
 except OddsAPIError as error:
     st.error(str(error))
+    show_odds_api_error_debug(error)

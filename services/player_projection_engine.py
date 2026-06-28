@@ -8,7 +8,10 @@ themselves.
 import pandas as pd
 
 from config import LEAGUE_SCORING
-from services.odds_api import fetch_todays_mlb_events, fetch_todays_mlb_hitter_props
+from services.odds_api import (
+    fetch_todays_mlb_hitter_props,
+    get_odds_data_source_status,
+)
 from services.player_stats import (
     PlayerStatsError,
     add_player_stats_to_dataframe,
@@ -367,6 +370,7 @@ def _apply_projection_sources(projection_table: pd.DataFrame) -> pd.DataFrame:
 
 def build_player_projection_table(
     availability_dataframe: pd.DataFrame | None = None,
+    force_refresh_odds: bool = False,
 ) -> pd.DataFrame:
     """Build the unified player projection table.
 
@@ -380,8 +384,9 @@ def build_player_projection_table(
         A dataframe with exactly one row per player.
     """
 
-    todays_events = fetch_todays_mlb_events()
-    prop_rows = fetch_todays_mlb_hitter_props(todays_events) if todays_events else []
+    prop_rows = fetch_todays_mlb_hitter_props(
+        force_refresh=force_refresh_odds,
+    )
     prop_projection_table = build_hitter_prop_projection_table(prop_rows)
 
     projection_table = _pick_best_bookmaker_row_per_player(prop_projection_table)
@@ -423,7 +428,9 @@ def build_player_projection_table(
         ascending=False,
     )
 
-    projection_table.attrs["player_stats_loaded"] = stats_loaded
-    projection_table.attrs["player_stats_error"] = stats_error
+    output_table = projection_table.reset_index(drop=True)
+    output_table.attrs["player_stats_loaded"] = stats_loaded
+    output_table.attrs["player_stats_error"] = stats_error
+    output_table.attrs["odds_data_source"] = get_odds_data_source_status()
 
-    return projection_table.reset_index(drop=True)
+    return output_table
