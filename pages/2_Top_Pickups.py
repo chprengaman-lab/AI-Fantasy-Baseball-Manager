@@ -122,6 +122,16 @@ def player_has_position(eligible_positions: str, selected_position: str) -> bool
     return selected_position in split_positions(eligible_positions)
 
 
+def get_first_starting_slot(eligible_positions: str) -> str:
+    """Return the first exact hitter slot a player can fill."""
+
+    player_positions = set(split_positions(eligible_positions))
+    for slot in LINEUP_SLOT_ORDER:
+        if slot in player_positions:
+            return slot
+    return ""
+
+
 def as_bool_series(series: pd.Series, default: bool = False) -> pd.Series:
     """Convert mixed bool/string/blank values into a reliable boolean Series."""
 
@@ -1070,6 +1080,8 @@ def filter_hitter_optimizer_pool(
         return pd.DataFrame()
 
     filtered = table.copy()
+    filtered = apply_actionability_flags(filtered)
+    filtered = filtered[as_bool_series(filtered["is_actionable_today"])].copy()
     if not include_unavailable_players:
         filtered = filtered[~filtered.apply(is_player_unavailable, axis=1)].copy()
 
@@ -1133,6 +1145,7 @@ def is_ranked_sportsbook_table_candidate(row) -> bool:
     )
     return (
         player_type == "hitter"
+        and not row_has_action_blocking_status(row)
         and bool(as_bool_series(pd.Series([row.get("has_sportsbook_props")])).iloc[0])
         and bool(as_bool_series(pd.Series([row.get("has_game_today")])).iloc[0])
         and bool(as_bool_series(pd.Series([row.get("is_available_today")])).iloc[0])
@@ -1145,6 +1158,9 @@ def get_ranked_sportsbook_exclusion_reason(row, player_search: str = "") -> str:
 
     if str(row.get("player_type", "")).strip().lower() != "hitter":
         return "not hitter"
+
+    if row_has_action_blocking_status(row):
+        return "on waivers / pending transaction"
 
     if not bool(as_bool_series(pd.Series([row.get("has_sportsbook_props")])).iloc[0]):
         return "no sportsbook props flag"
@@ -1321,6 +1337,311 @@ def build_projection_coverage_summary(
         "free_agents_matched": available_matched,
         "free_agents_missing": available_missing,
     }
+
+
+ACTION_BLOCKING_STATUS_MARKERS = {
+    "WAIVERS",
+    "ON WAIVERS",
+    "CLAIMED",
+    "PENDING",
+}
+LINEUP_SLOT_ORDER = ["C", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "DH"]
+CURRENT_ROSTER_SPOT_ORDER = LINEUP_SLOT_ORDER + ["BE", "BENCH"]
+DISPLAY_NUMERIC_COLUMNS = [
+    "projected_fantasy_points",
+    "projected_gain",
+    "current_projected_points",
+    "new_projected_points",
+    "point_difference",
+    "risk_adjusted_score",
+    "current_starting_total",
+    "new_starting_total",
+    "match_score",
+    "stats_match_score",
+    "sportsbook_match_score",
+]
+DISPLAY_BOOLEAN_COLUMNS = [
+    "has_sportsbook_props",
+    "is_available_today",
+    "has_game_today",
+    "is_actionable_today",
+    "included_in_ranked_sportsbook_table",
+    "found_in_espn_free_agents",
+    "found_in_projection_table",
+]
+DISPLAY_TEXT_COLUMNS = [
+    "projection_source",
+    "projection_confidence",
+    "availability_note",
+    "missing_markets",
+    "fallback_markets_used",
+    "roster_status",
+    "status_note",
+    "game_today_note",
+    "fallback_projection_note",
+    "markets_available",
+    "injury_status",
+    "status",
+    "player_notes",
+    "lineup_status",
+    "fantasy_status",
+    "matched_sportsbook_player",
+    "matched_projection_player",
+    "sportsbook_match_method",
+    "match_method",
+    "exclusion_reason",
+    "filter_reason",
+    "risk_adjusted_note",
+    "move_explanation",
+]
+
+
+def normalize_display_numeric_columns(dataframe: pd.DataFrame) -> pd.DataFrame:
+    """Keep Streamlit/Arrow numeric columns numeric before display."""
+
+    dataframe = dataframe.copy()
+    for column in DISPLAY_NUMERIC_COLUMNS:
+        if column in dataframe.columns:
+            dataframe[column] = pd.to_numeric(
+                dataframe[column],
+                errors="coerce",
+            ).fillna(0.0)
+    return dataframe
+
+
+def clean_top_pickups_dataframe_for_display(dataframe: pd.DataFrame) -> pd.DataFrame:
+    """Normalize Top Pickups table dtypes before Streamlit renders them.
+
+    Streamlit sends pandas tables through PyArrow. Mixed columns like True/"" or
+    4.2/"" can trigger conversion warnings, so booleans, numbers, and text are
+    cleaned separately before the shared dataframe helper clears attrs.
+    """
+
+    if dataframe is None:
+        return clean_dataframe_for_streamlit(pd.DataFrame())
+
+    dataframe = dataframe.copy()
+    for column in DISPLAY_BOOLEAN_COLUMNS:
+        if column in dataframe.columns:
+            dataframe[column] = as_bool_series(dataframe[column]).fillna(False).astype(bool)
+
+    dataframe = normalize_display_numeric_columns(dataframe)
+
+    for column in DISPLAY_TEXT_COLUMNS:
+        if column in dataframe.columns:
+            dataframe[column] = dataframe[column].where(dataframe[column].notna(), "").astype(str)
+
+    return clean_dataframe_for_streamlit(dataframe)
+
+
+def row_has_action_blocking_status(row) -> bool:
+    """Return True when a player cannot be added because of transaction status."""
+
+    checked_values = []
+    for column in [
+        "status",
+        "roster_status",
+        "transaction_status",
+        "fantasy_status",
+        "availability_note",
+    ]:
+        value = row.get(column, "")
+        if pd.isna(value):
+            continue
+        checked_values.append(str(value).upper())
+
+    combined_status = " | ".join(checked_values)
+    return any(marker in combined_status for marker in ACTION_BLOCKING_STATUS_MARKERS)
+
+
+def apply_actionability_flags(player_table: pd.DataFrame) -> pd.DataFrame:
+    """Mark players who are visible for review but unavailable for action."""
+
+    player_table = player_table.copy()
+    if player_table.empty:
+        return player_table
+
+    player_table["is_actionable_today"] = ~player_table.apply(
+        row_has_action_blocking_status,
+        axis=1,
+    )
+    blocked_mask = ~as_bool_series(player_table["is_actionable_today"])
+    if "availability_note" not in player_table.columns:
+        player_table["availability_note"] = ""
+    existing_notes = player_table.loc[blocked_mask, "availability_note"].fillna("").astype(str)
+    player_table.loc[blocked_mask, "availability_note"] = existing_notes.apply(
+        lambda note: (
+            "Player is on waivers and cannot be added today."
+            if not note.strip()
+            else f"{note}; Player is on waivers and cannot be added today."
+        )
+    )
+    return player_table
+
+
+def get_lineup_display(lineup_df: pd.DataFrame) -> pd.DataFrame:
+    """Create the user-facing optimized lineup table."""
+
+    lineup_display = lineup_df.copy()
+    if lineup_display.empty:
+        return lineup_display
+
+    lineup_display["optimized_slot"] = lineup_display["roster_slot"]
+    lineup_display["current_roster_spot"] = lineup_display.get("roster_spot", "")
+    lineup_display["slot_sort_order"] = lineup_display["optimized_slot"].map(
+        {slot: index for index, slot in enumerate(LINEUP_SLOT_ORDER)}
+    )
+    lineup_display = lineup_display.sort_values("slot_sort_order", na_position="last")
+    return normalize_display_numeric_columns(lineup_display)
+
+
+def build_current_roster_lineup_actions(
+    roster_group_table: pd.DataFrame,
+    lineup_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Show current ESPN roster spots next to suggested optimized spots."""
+
+    if roster_group_table is None or roster_group_table.empty:
+        return pd.DataFrame()
+
+    roster = roster_group_table.copy()
+    suggested_slot_by_player = (
+        lineup_df.set_index("player")["roster_slot"].to_dict()
+        if lineup_df is not None and not lineup_df.empty
+        else {}
+    )
+    roster = roster[roster.apply(row_is_hitter, axis=1)].copy()
+    roster["current_roster_spot"] = roster.get("roster_spot", "")
+    roster["suggested_roster_spot"] = roster["player"].map(suggested_slot_by_player).fillna("BE")
+
+    def get_action(row) -> str:
+        current_spot = str(row.get("current_roster_spot", "")).upper()
+        suggested_spot = str(row.get("suggested_roster_spot", "")).upper()
+        if not bool(as_bool_series(pd.Series([row.get("has_game_today")])).iloc[0]):
+            return "No game today"
+        if current_spot == suggested_spot and suggested_spot != "BE":
+            return "Keep starting"
+        if suggested_spot != "BE" and current_spot == "BE":
+            return f"Start at {suggested_spot}"
+        if suggested_spot != "BE" and current_spot != suggested_spot:
+            return f"Move to {suggested_spot}"
+        if current_spot != "BE" and suggested_spot == "BE":
+            return "Bench"
+        return "Stay bench"
+
+    roster["lineup_action"] = roster.apply(get_action, axis=1)
+    roster["status_note"] = roster.apply(
+        lambda row: row.get("availability_note", "")
+        or row.get("game_today_note", "")
+        or "",
+        axis=1,
+    )
+    roster["roster_sort_order"] = roster["current_roster_spot"].astype(str).str.upper().map(
+        {slot: index for index, slot in enumerate(CURRENT_ROSTER_SPOT_ORDER)}
+    ).fillna(99)
+    roster = roster.sort_values(["roster_sort_order", "player"])
+    return normalize_display_numeric_columns(roster)
+
+
+def build_full_lineup_diff(
+    current_lineup_df: pd.DataFrame,
+    new_lineup_df: pd.DataFrame,
+    add_player: str = "",
+) -> pd.DataFrame:
+    """Compare full before/after optimized lineups by slot."""
+
+    current_by_slot = (
+        current_lineup_df.set_index("roster_slot")
+        if current_lineup_df is not None and not current_lineup_df.empty
+        else pd.DataFrame()
+    )
+    new_by_slot = (
+        new_lineup_df.set_index("roster_slot")
+        if new_lineup_df is not None and not new_lineup_df.empty
+        else pd.DataFrame()
+    )
+    current_players = set(current_lineup_df.get("player", [])) if current_lineup_df is not None else set()
+    new_players = set(new_lineup_df.get("player", [])) if new_lineup_df is not None else set()
+    rows = []
+    for slot in LINEUP_SLOT_ORDER:
+        current_row = current_by_slot.loc[slot] if slot in current_by_slot.index else {}
+        new_row = new_by_slot.loc[slot] if slot in new_by_slot.index else {}
+        current_player = current_row.get("player", "")
+        new_player = new_row.get("player", "")
+        current_points = pd.to_numeric(current_row.get("projected_fantasy_points", 0), errors="coerce")
+        new_points = pd.to_numeric(new_row.get("projected_fantasy_points", 0), errors="coerce")
+        current_points = 0.0 if pd.isna(current_points) else float(current_points)
+        new_points = 0.0 if pd.isna(new_points) else float(new_points)
+        if current_player == new_player:
+            change_type = "unchanged"
+        elif new_player == add_player:
+            change_type = "added"
+        elif current_player and current_player not in new_players:
+            change_type = "benched"
+        elif new_player in current_players and current_player in new_players:
+            change_type = "moved"
+        elif new_points >= current_points:
+            change_type = "upgraded"
+        else:
+            change_type = "downgraded"
+        rows.append(
+            {
+                "slot": slot,
+                "current_player": current_player,
+                "current_projected_points": current_points,
+                "new_player": new_player,
+                "new_projected_points": new_points,
+                "point_difference": new_points - current_points,
+                "change_type": change_type,
+            }
+        )
+
+    diff = pd.DataFrame(rows)
+    benched_players = sorted(current_players - new_players)
+    if benched_players:
+        diff.attrs["benched_players"] = benched_players
+    return normalize_display_numeric_columns(diff)
+
+
+def build_move_explanation(
+    move,
+    current_lineup_df: pd.DataFrame,
+    new_lineup_df: pd.DataFrame,
+) -> tuple[str, str, str]:
+    """Build a plain-English add/drop lineup chain."""
+
+    add_player = str(move.get("add_player", ""))
+    drop_player = str(move.get("drop_player", ""))
+    diff = build_full_lineup_diff(current_lineup_df, new_lineup_df, add_player)
+    suggested_slot = ""
+    added_rows = diff[diff["new_player"] == add_player]
+    if not added_rows.empty:
+        suggested_slot = str(added_rows.iloc[0]["slot"])
+
+    changed_rows = diff[diff["change_type"] != "unchanged"]
+    chain_parts = []
+    if drop_player:
+        chain_parts.append(f"Drop {drop_player}")
+    if add_player:
+        chain_parts.append(f"add {add_player}")
+    if suggested_slot:
+        chain_parts.append(f"start {add_player} at {suggested_slot}")
+    for _, row in changed_rows.iterrows():
+        new_player = row["new_player"]
+        current_player = row["current_player"]
+        slot = row["slot"]
+        if new_player and new_player != add_player and row["change_type"] in {"moved", "upgraded"}:
+            chain_parts.append(f"move {new_player} to {slot}")
+        if current_player and current_player not in set(new_lineup_df.get("player", [])):
+            chain_parts.append(f"bench {current_player}")
+    explanation = ", ".join(dict.fromkeys(chain_parts)).strip()
+    if explanation:
+        explanation += "."
+    risk_note = ""
+    drop_risk = str(move.get("drop_risk", ""))
+    if drop_risk in {"Medium", "High"}:
+        risk_note = f"Review season-long risk before dropping a {drop_risk.lower()} risk player."
+    return suggested_slot, explanation, risk_note
 
 
 def show_projection_coverage_summary(summary: dict) -> None:
@@ -1552,7 +1873,8 @@ def show_lineup_impact(
         new_roster = pd.concat([new_roster, add_rows], ignore_index=True)
 
     new_lineup, _, _ = optimize_hitter_lineup(new_roster)
-    impact = compare_lineups(current_lineup, new_lineup)
+    add_player = str(best_move.get("add_player", ""))
+    impact = build_full_lineup_diff(current_lineup, new_lineup, add_player)
     columns = st.columns(3)
     columns[0].metric(
         "Current Starting Total",
@@ -1570,7 +1892,12 @@ def show_lineup_impact(
     if impact.empty:
         st.info("The optimized lineup slots did not change.")
     else:
-        st.dataframe(clean_dataframe_for_streamlit(impact.round(3)), width="stretch")
+        st.dataframe(
+            clean_top_pickups_dataframe_for_display(
+                normalize_display_numeric_columns(impact).round(3)
+            ),
+            width="stretch",
+        )
 
 
 def show_grouped_roster_tables(
@@ -1593,11 +1920,7 @@ def show_grouped_roster_tables(
     rp_mask = roster["roster_spot"].astype(str).str.upper().eq("RP") | (
         roster["player_type"].astype(str).str.upper().eq("RP")
     )
-    hitter_mask = ~pitchers & ~unavailable
-
     groups = {
-        "Starting Hitters": roster[hitter_mask & roster["player"].isin(starters)],
-        "Bench Hitters": roster[hitter_mask & ~roster["player"].isin(starters)],
         "Starting Pitchers": roster[~unavailable & sp_mask],
         "Relief Pitchers": roster[~unavailable & rp_mask],
         "Injured / Unavailable": roster[unavailable],
@@ -1621,7 +1944,7 @@ def show_grouped_roster_tables(
         else:
             columns = [column for column in display_columns if column in group.columns]
             st.dataframe(
-                clean_dataframe_for_streamlit(group[columns].round(3)),
+                clean_top_pickups_dataframe_for_display(group[columns].round(3)),
                 width="stretch",
             )
 
@@ -1630,6 +1953,8 @@ def show_split_pickup_recommendations(
     recommendations: pd.DataFrame,
     selected_min_gain: float,
     show_no_gain_moves: bool,
+    roster_projection_table: pd.DataFrame,
+    available_projection_table: pd.DataFrame,
 ) -> None:
     """Show Add Only and Add/Drop moves in separate tables."""
 
@@ -1671,29 +1996,51 @@ def show_split_pickup_recommendations(
             "add_projection_source",
             "add_projection_confidence",
         ]
-        st.dataframe(clean_dataframe_for_streamlit(add_only[columns].round(3)), width="stretch")
+        st.dataframe(clean_top_pickups_dataframe_for_display(add_only[columns].round(3)), width="stretch")
 
     st.subheader("Best Add/Drop Moves")
     if add_drop.empty:
         st.info("No positive add/drop moves found.")
     else:
+        current_lineup, _, _ = optimize_hitter_lineup(roster_projection_table)
+        enriched_rows = []
+        for _, move in add_drop.iterrows():
+            new_roster = roster_projection_table.copy()
+            drop_name = normalize_player_name(move.get("drop_player", ""))
+            add_name = normalize_player_name(move.get("add_player", ""))
+            new_roster = new_roster[new_roster["normalized_player_name"] != drop_name]
+            add_rows = available_projection_table[
+                available_projection_table["normalized_player_name"] == add_name
+            ]
+            new_roster = pd.concat([new_roster, add_rows], ignore_index=True)
+            new_lineup, _, _ = optimize_hitter_lineup(new_roster)
+            suggested_slot, explanation, risk_note = build_move_explanation(
+                move,
+                current_lineup,
+                new_lineup,
+            )
+            row = move.to_dict()
+            row["suggested_slot_for_add"] = suggested_slot
+            row["move_explanation"] = explanation
+            row["risk_adjusted_note"] = risk_note
+            enriched_rows.append(row)
+        add_drop = normalize_display_numeric_columns(pd.DataFrame(enriched_rows))
         columns = [
             "add_player",
-            "add_eligible_positions",
             "drop_player",
-            "drop_eligible_positions",
-            "drop_long_term_value",
-            "drop_keeper_status",
-            "drop_risk",
+            "suggested_slot_for_add",
             "projected_gain",
-            "risk_adjusted_score",
-            "risk_adjusted_label",
+            "current_starting_total",
             "new_starting_total",
-            "recommendation",
+            "move_explanation",
+            "risk_adjusted_score",
+            "risk_adjusted_note",
         ]
         visible_columns = [column for column in columns if column in add_drop.columns]
         st.dataframe(
-            clean_dataframe_for_streamlit(add_drop[visible_columns].round(3)),
+            clean_top_pickups_dataframe_for_display(
+                normalize_display_numeric_columns(add_drop[visible_columns]).round(3)
+            ),
             width="stretch",
         )
 
@@ -1729,7 +2076,7 @@ def show_multi_add_scenarios(
         "risk_adjusted_label",
         "recommendation",
     ]
-    st.dataframe(clean_dataframe_for_streamlit(scenarios[columns].round(3)), width="stretch")
+    st.dataframe(clean_top_pickups_dataframe_for_display(scenarios[columns].round(3)), width="stretch")
 
 
 def show_replacement_value_by_position(
@@ -1772,7 +2119,7 @@ def show_replacement_value_by_position(
         available_projection_table,
         master_pickup_table,
     )
-    st.dataframe(clean_dataframe_for_streamlit(replacement_table.round(3)), width="stretch")
+    st.dataframe(clean_top_pickups_dataframe_for_display(replacement_table.round(3)), width="stretch")
 
 
 def log_timing(timing_rows: list[dict], label: str, start_time: float) -> float:
@@ -1916,6 +2263,10 @@ try:
             "Development safety setting: healthy bench hitters without Core or "
             "undroppable protection can be evaluated as drop candidates."
         ),
+    )
+    show_developer_diagnostics = st.sidebar.checkbox(
+        "Show developer diagnostics",
+        value=False,
     )
 
     if refresh_live_odds_data:
@@ -2081,6 +2432,7 @@ try:
         master_pickup_table["sportsbook_match_score"],
         errors="coerce",
     ).fillna(0)
+    master_pickup_table = apply_actionability_flags(master_pickup_table)
     sportsbook_match_diagnostics = pd.concat(
         [roster_match_diagnostics, available_match_diagnostics],
         ignore_index=True,
@@ -2335,111 +2687,112 @@ try:
         with action_plan_container:
             show_todays_action_plan(best_move)
 
-    with st.expander("Top Pickups Performance Profile", expanded=True):
-        st.write(
-            "These timings identify where the page spends time. The optimizer "
-            "uses a reduced candidate pool before simulations so it does not "
-            "test every free agent against every roster player."
-        )
-        metric_columns = st.columns(4)
-        metric_columns[0].metric(
-            "Free Agents Loaded",
-            profile_counts["free_agents_loaded"],
-        )
-        metric_columns[1].metric(
-            "Available Hitters",
-            profile_counts["available_hitters"],
-        )
-        metric_columns[2].metric(
-            "Hitters With Projections",
-            profile_counts["available_hitters_with_projections"],
-        )
-        metric_columns[3].metric(
-            "Candidates Simulated",
-            profile_counts["available_hitter_candidates_simulated"],
-        )
-        daily_columns = st.columns(6)
-        daily_columns[0].metric(
-            "Hitters With Game Today",
-            profile_counts["hitters_with_game_today"],
-        )
-        daily_columns[1].metric(
-            "Hitters With Sportsbook Props",
-            profile_counts["hitters_with_sportsbook_props"],
-        )
-        daily_columns[2].metric(
-            "Stat Fallback Only",
-            profile_counts["stat_fallback_only_hitters"],
-        )
-        daily_columns[3].metric(
-            "Excluded: No Game",
-            profile_counts["hitters_excluded_no_game"],
-        )
-        daily_columns[4].metric(
-            "Excluded: Injury/Unavailable",
-            profile_counts["hitters_excluded_unavailable"],
-        )
-        daily_columns[5].metric(
-            "Eligible For Optimization",
-            profile_counts["hitters_eligible_for_optimization"],
-        )
-        pipeline_columns = st.columns(4)
-        pipeline_columns[0].metric(
-            "After Player Type Filter",
-            profile_counts["free_agents_after_player_type_filter"],
-        )
-        pipeline_columns[1].metric(
-            "After Injury Filter",
-            profile_counts["free_agents_after_injury_filter"],
-        )
-        pipeline_columns[2].metric(
-            "After Game-Today Filter",
-            profile_counts["free_agents_after_game_today_filter"],
-        )
-        pipeline_columns[3].metric(
-            "After No-Props Filter",
-            profile_counts["free_agents_after_no_props_filter"],
-        )
-        match_pipeline_columns = st.columns(3)
-        match_pipeline_columns[0].metric(
-            "Sent To Projection Matching",
-            profile_counts["free_agents_sent_to_projection_matching"],
-        )
-        match_pipeline_columns[1].metric(
-            "Matched To Projections",
-            profile_counts["free_agents_matched_to_projections"],
-        )
-        match_pipeline_columns[2].metric(
-            "Unmatched To Projections",
-            profile_counts["free_agents_unmatched_to_projections"],
-        )
-        simulation_columns = st.columns(3)
-        simulation_columns[0].metric(
-            "Add-Only Simulations",
-            profile_counts["add_only_simulations_executed"],
-        )
-        simulation_columns[1].metric(
-            "Add/Drop Simulations",
-            profile_counts["add_drop_simulations_executed"],
-        )
-        simulation_columns[2].metric(
-            "Multi-Add Simulations",
-            profile_counts["multi_add_simulations_executed"],
-        )
-        match_columns = st.columns(2)
-        match_columns[0].metric(
-            "ESPN Free Agents Matched To Sportsbook",
-            profile_counts["espn_free_agents_matched_to_sportsbook"],
-        )
-        match_columns[1].metric(
-            "Unmatched Sportsbook Projection Players",
-            profile_counts["unmatched_sportsbook_projection_players"],
-        )
-        st.dataframe(
-            clean_dataframe_for_streamlit(pd.DataFrame(timing_rows)),
-            width="stretch",
-        )
-    st.header("Best Current Hitter Lineup")
+    if show_developer_diagnostics:
+        with st.expander("Developer Diagnostics - Performance Profile", expanded=False):
+            st.write(
+                "These timings identify where the page spends time. The optimizer "
+                "uses a reduced candidate pool before simulations so it does not "
+                "test every free agent against every roster player."
+            )
+            metric_columns = st.columns(4)
+            metric_columns[0].metric(
+                "Free Agents Loaded",
+                profile_counts["free_agents_loaded"],
+            )
+            metric_columns[1].metric(
+                "Available Hitters",
+                profile_counts["available_hitters"],
+            )
+            metric_columns[2].metric(
+                "Hitters With Projections",
+                profile_counts["available_hitters_with_projections"],
+            )
+            metric_columns[3].metric(
+                "Candidates Simulated",
+                profile_counts["available_hitter_candidates_simulated"],
+            )
+            daily_columns = st.columns(6)
+            daily_columns[0].metric(
+                "Hitters With Game Today",
+                profile_counts["hitters_with_game_today"],
+            )
+            daily_columns[1].metric(
+                "Hitters With Sportsbook Props",
+                profile_counts["hitters_with_sportsbook_props"],
+            )
+            daily_columns[2].metric(
+                "Stat Fallback Only",
+                profile_counts["stat_fallback_only_hitters"],
+            )
+            daily_columns[3].metric(
+                "Excluded: No Game",
+                profile_counts["hitters_excluded_no_game"],
+            )
+            daily_columns[4].metric(
+                "Excluded: Injury/Unavailable",
+                profile_counts["hitters_excluded_unavailable"],
+            )
+            daily_columns[5].metric(
+                "Eligible For Optimization",
+                profile_counts["hitters_eligible_for_optimization"],
+            )
+            pipeline_columns = st.columns(4)
+            pipeline_columns[0].metric(
+                "After Player Type Filter",
+                profile_counts["free_agents_after_player_type_filter"],
+            )
+            pipeline_columns[1].metric(
+                "After Injury Filter",
+                profile_counts["free_agents_after_injury_filter"],
+            )
+            pipeline_columns[2].metric(
+                "After Game-Today Filter",
+                profile_counts["free_agents_after_game_today_filter"],
+            )
+            pipeline_columns[3].metric(
+                "After No-Props Filter",
+                profile_counts["free_agents_after_no_props_filter"],
+            )
+            match_pipeline_columns = st.columns(3)
+            match_pipeline_columns[0].metric(
+                "Sent To Projection Matching",
+                profile_counts["free_agents_sent_to_projection_matching"],
+            )
+            match_pipeline_columns[1].metric(
+                "Matched To Projections",
+                profile_counts["free_agents_matched_to_projections"],
+            )
+            match_pipeline_columns[2].metric(
+                "Unmatched To Projections",
+                profile_counts["free_agents_unmatched_to_projections"],
+            )
+            simulation_columns = st.columns(3)
+            simulation_columns[0].metric(
+                "Add-Only Simulations",
+                profile_counts["add_only_simulations_executed"],
+            )
+            simulation_columns[1].metric(
+                "Add/Drop Simulations",
+                profile_counts["add_drop_simulations_executed"],
+            )
+            simulation_columns[2].metric(
+                "Multi-Add Simulations",
+                profile_counts["multi_add_simulations_executed"],
+            )
+            match_columns = st.columns(2)
+            match_columns[0].metric(
+                "ESPN Free Agents Matched To Sportsbook",
+                profile_counts["espn_free_agents_matched_to_sportsbook"],
+            )
+            match_columns[1].metric(
+                "Unmatched Sportsbook Projection Players",
+                profile_counts["unmatched_sportsbook_projection_players"],
+            )
+            st.dataframe(
+                clean_top_pickups_dataframe_for_display(pd.DataFrame(timing_rows)),
+                width="stretch",
+            )
+    st.header("Optimized Starting Lineup")
     st.write("This optimizes only your current roster. Available players are not used here.")
     if not has_roster_data:
         st.info("Load your roster to optimize the current hitter lineup.")
@@ -2453,17 +2806,7 @@ try:
             "Projected Starting Hitter Total",
             round(lineup_df["projected_fantasy_points"].sum(), 2),
         )
-        slot_order = ["C", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "DH"]
-        lineup_display = lineup_df.copy()
-        lineup_display["optimized_slot"] = lineup_display["roster_slot"]
-        lineup_display["current_roster_spot"] = lineup_display.get("roster_spot", "")
-        lineup_display["slot_sort_order"] = lineup_display["optimized_slot"].map(
-            {slot: index for index, slot in enumerate(slot_order)}
-        )
-        lineup_display = lineup_display.sort_values(
-            "slot_sort_order",
-            na_position="last",
-        )
+        lineup_display = get_lineup_display(lineup_df)
         lineup_columns = [
             column
             for column in [
@@ -2475,21 +2818,43 @@ try:
                 "projection_source",
                 "projection_confidence",
                 "injury_status",
-                "availability_note",
             ]
             if column in lineup_display.columns
         ]
-        st.subheader("Optimized Starting Lineup")
         st.write(
             "Optimized slot is where the app recommends starting the player "
             "today. Current roster spot is where ESPN currently has him."
         )
         st.dataframe(
-            clean_dataframe_for_streamlit(lineup_display[lineup_columns].round(3)),
+            clean_top_pickups_dataframe_for_display(lineup_display[lineup_columns].round(3)),
             width="stretch",
         )
-        show_grouped_roster_tables(lineup_df, roster_group_table)
-    st.header("Pickup Recommendations")
+        st.header("Current Roster / Suggested Lineup Changes")
+        roster_changes = build_current_roster_lineup_actions(roster_group_table, lineup_df)
+        roster_change_columns = [
+            column
+            for column in [
+                "player",
+                "current_roster_spot",
+                "suggested_roster_spot",
+                "eligible_positions",
+                "projected_fantasy_points",
+                "projection_source",
+                "status_note",
+                "lineup_action",
+            ]
+            if column in roster_changes.columns
+        ]
+        st.dataframe(
+            clean_top_pickups_dataframe_for_display(
+                roster_changes[roster_change_columns].round(3)
+            ),
+            width="stretch",
+        )
+        with st.expander("Pitchers / Injured Players", expanded=False):
+            st.write("Pitcher optimization is not built yet.")
+            show_grouped_roster_tables(lineup_df, roster_group_table)
+    st.header("Best Add/Drop Moves")
     if not (has_roster_data and has_available_data):
         st.info("Load both roster and available-player data to calculate recommendations.")
     else:
@@ -2501,7 +2866,6 @@ try:
             step=0.5,
         )
         show_no_gain_moves = st.sidebar.checkbox("Show no-gain moves", value=False)
-        show_projection_coverage_summary(projection_coverage_summary)
         if roster_summary and roster_summary["open_active_spots"] == 0:
             st.info(
                 "Your active roster is full, so pickup recommendations are "
@@ -2541,6 +2905,8 @@ try:
                 pickup_recommendations,
                 selected_min_gain,
                 show_no_gain_moves,
+                roster_projection_table,
+                available_projection_table,
             )
     st.header("Ranked Available Hitters with Sportsbook Props")
     st.write(
@@ -2639,50 +3005,71 @@ try:
         if ranked_available.empty:
             st.info("No available hitters with sportsbook props match the current filters.")
         else:
+            ranked_available["suggested_best_slot"] = ranked_available[
+                "eligible_positions"
+            ].apply(get_first_starting_slot)
             visible_columns = [
-                column for column in TOP_PICKUPS_COLUMNS if column in ranked_available.columns
+                column
+                for column in [
+                    "player",
+                    "team",
+                    "eligible_positions",
+                    "projected_fantasy_points",
+                    "projection_source",
+                    "projection_confidence",
+                    "suggested_best_slot",
+                    "bookmaker_count",
+                    "markets_available",
+                ]
+                if column in ranked_available.columns
             ]
             st.dataframe(
-                clean_dataframe_for_streamlit(ranked_available[visible_columns].round(3)),
+                clean_top_pickups_dataframe_for_display(
+                    normalize_display_numeric_columns(
+                        ranked_available[visible_columns]
+                    ).round(3)
+                ),
                 width="stretch",
             )
 
-    st.header("Stat Fallback Watchlist")
-    st.write(
-        "These players have a game today but no sportsbook hitter props. They "
-        "may not be expected to start, so they are excluded from main "
-        "recommendations by default."
-    )
-    if stat_fallback_watchlist.empty:
-        st.info("No stat-fallback-only available hitters found.")
-    else:
-        stat_fallback_watchlist = stat_fallback_watchlist.sort_values(
-            "projected_fantasy_points",
-            ascending=False,
+    with st.expander("Stat Fallback Watchlist", expanded=False):
+        st.write(
+            "These players have a game today but no sportsbook hitter props. They "
+            "may not be expected to start, so they are excluded from main "
+            "recommendations by default."
         )
-        watchlist_columns = [
-            column
-            for column in [
-                "player",
-                "eligible_positions",
-                "pro_team",
+        if stat_fallback_watchlist.empty:
+            st.info("No stat-fallback-only available hitters found.")
+        else:
+            stat_fallback_watchlist = stat_fallback_watchlist.sort_values(
                 "projected_fantasy_points",
-                "projection_source",
-                "projection_confidence",
-                "has_game_today",
-                "game_today_note",
-                "is_available_today",
-                "availability_note",
-                "fallback_projection_note",
+                ascending=False,
+            )
+            watchlist_columns = [
+                column
+                for column in [
+                    "player",
+                    "eligible_positions",
+                    "pro_team",
+                    "projected_fantasy_points",
+                    "projection_source",
+                    "projection_confidence",
+                    "has_game_today",
+                    "game_today_note",
+                    "is_available_today",
+                    "availability_note",
+                    "fallback_projection_note",
+                ]
+                if column in stat_fallback_watchlist.columns
             ]
-            if column in stat_fallback_watchlist.columns
-        ]
-        st.dataframe(
-            clean_dataframe_for_streamlit(
-                stat_fallback_watchlist[watchlist_columns].round(3)
-            ),
-            width="stretch",
-        )
+            st.dataframe(
+                clean_top_pickups_dataframe_for_display(
+                    normalize_display_numeric_columns(
+                        stat_fallback_watchlist[watchlist_columns]
+                    ).round(3)
+                ),
+                width="stretch",
+            )
 
     if not available_pitchers.empty:
         with st.expander("Available Pitchers"):
@@ -2700,7 +3087,7 @@ try:
                 if column in available_pitchers.columns
             ]
             st.dataframe(
-                clean_dataframe_for_streamlit(available_pitchers[pitcher_columns]),
+                clean_top_pickups_dataframe_for_display(available_pitchers[pitcher_columns]),
                 width="stretch",
             )
 
@@ -2709,16 +3096,17 @@ try:
         & master_pickup_table.apply(row_is_hitter, axis=1)
         & (
             master_pickup_table.apply(is_player_unavailable, axis=1)
+            | master_pickup_table.apply(row_has_action_blocking_status, axis=1)
             | ~as_bool_series(master_pickup_table["has_game_today"])
             | ~as_bool_series(master_pickup_table["has_sportsbook_props"])
         )
     ].copy()
     if not unavailable_free_agents.empty:
-        with st.expander("Unavailable / No Game / No Props Review"):
+        with st.expander("Unavailable / Waivers / No Game / No Props Review", expanded=False):
             st.write(
                 "These free-agent hitters are excluded by default because they "
-                "are injured/unavailable, their MLB team does not play today, "
-                "or they do not have sportsbook hitter props."
+                "are injured/unavailable, on waivers or pending, their MLB team "
+                "does not play today, or they do not have sportsbook hitter props."
             )
             review_columns = [
                 "player",
@@ -2744,498 +3132,491 @@ try:
                 if column in unavailable_free_agents.columns
             ]
             st.dataframe(
-                clean_dataframe_for_streamlit(
+                clean_top_pickups_dataframe_for_display(
                     unavailable_free_agents[visible_columns].sort_values("player")
                 ),
                 width="stretch",
             )
 
-    with st.expander("Availability Classification Debug", expanded=True):
-        st.write(
-            "This shows the exact status fields checked for available hitters. "
-            "Blank, null, nan, Active, Available, Normal, and Healthy values are ignored."
-        )
-        availability_debug_source = (
-            raw_available_hitters.copy()
-            if "raw_available_hitters" in locals() and not raw_available_hitters.empty
-            else pd.DataFrame()
-        )
-        if availability_debug_source.empty:
-            st.info("No available hitters are loaded for availability debugging.")
-        else:
-            availability_details = availability_debug_source.apply(
-                classify_player_availability,
-                axis=1,
-                result_type="expand",
+    if show_developer_diagnostics:
+        with st.expander("Developer Diagnostics - Availability Classification", expanded=False):
+            st.write(
+                "This shows the exact status fields checked for available hitters. "
+                "Blank, null, nan, Active, Available, Normal, and Healthy values are ignored."
             )
-            availability_debug_source["raw_status_values_checked"] = availability_details[
-                "raw_status_values_checked"
-            ]
-            availability_debug_source["unavailable_marker_detected"] = availability_details[
-                "unavailable_marker_detected"
-            ]
-            availability_debug_source["is_available_today"] = ~availability_details[
-                "is_unavailable"
-            ]
-            debug_columns = [
-                column
-                for column in [
-                    "player",
-                    "injury_status",
-                    "status",
-                    "roster_status",
-                    "roster_spot",
-                    "availability_note",
-                    "raw_status_values_checked",
-                    "unavailable_marker_detected",
-                    "is_available_today",
-                    "projected_fantasy_points",
-                    "projection_source",
-                ]
-                if column in availability_debug_source.columns
-            ]
-            st.dataframe(
-                clean_dataframe_for_streamlit(
-                    availability_debug_source[debug_columns].head(50).round(3)
-                ),
-                width="stretch",
+            availability_debug_source = (
+                raw_available_hitters.copy()
+                if "raw_available_hitters" in locals() and not raw_available_hitters.empty
+                else pd.DataFrame()
             )
-
-    with st.expander("Sportsbook Match Debug", expanded=True):
-        st.write(
-            "This verifies whether ESPN free agents are joining to sportsbook "
-            "projection rows. Matching tries player_match_key first, then "
-            "normalized player name, then fuzzy matching at a safe threshold."
-        )
-        available_source_table = (
-            add_player_matching_columns(available_players_dataframe)
-            if available_players_dataframe is not None
-            else pd.DataFrame()
-        )
-        available_source_hitters = (
-            available_source_table[available_source_table.apply(row_is_hitter, axis=1)].copy()
-            if not available_source_table.empty
-            else pd.DataFrame()
-        )
-        available_diagnostics = (
-            sportsbook_match_diagnostics[
-                sportsbook_match_diagnostics["espn_player"].isin(
-                    available_source_hitters["player"]
-                    if not available_source_hitters.empty
-                    else []
-                )
-            ].copy()
-            if not sportsbook_match_diagnostics.empty
-            else pd.DataFrame()
-        )
-        exact_normalized_count = (
-            int((available_diagnostics["match_method"] == "exact normalized name").sum())
-            if not available_diagnostics.empty
-            else 0
-        )
-        exact_key_count = (
-            int((available_diagnostics["match_method"] == "exact match key").sum())
-            if not available_diagnostics.empty
-            else 0
-        )
-        fuzzy_match_count = (
-            int((available_diagnostics["match_method"] == "fuzzy").sum())
-            if not available_diagnostics.empty
-            else 0
-        )
-        unmatched_espn_free_agents = (
-            int((~as_bool_series(available_diagnostics["has_sportsbook_props"])).sum())
-            if not available_diagnostics.empty
-            else len(available_source_hitters)
-        )
-
-        debug_metrics = st.columns(7)
-        debug_metrics[0].metric(
-            "Sportsbook Projection Rows",
-            len(sportsbook_projection_table),
-        )
-        debug_metrics[1].metric(
-            "ESPN FA Hitter Rows",
-            len(available_source_hitters),
-        )
-        debug_metrics[2].metric("Exact Key Matches", exact_key_count)
-        debug_metrics[3].metric(
-            "Exact Normalized Matches",
-            exact_normalized_count,
-        )
-        debug_metrics[4].metric("Fuzzy Matches", fuzzy_match_count)
-        debug_metrics[5].metric(
-            "Unmatched ESPN FAs",
-            unmatched_espn_free_agents,
-        )
-        debug_metrics[6].metric(
-            "Unmatched Sportsbook Players",
-            profile_counts["unmatched_sportsbook_projection_players"],
-        )
-
-        exact_key_matched_free_agents = master_pickup_table[
-            (master_pickup_table["roster_status"] == "Available")
-            & master_pickup_table["sportsbook_match_method"].astype(str).eq(
-                "exact match key"
-            )
-        ].copy()
-        if not exact_key_matched_free_agents.empty:
-            exact_key_matched_free_agents["matched_projection_player"] = (
-                exact_key_matched_free_agents["matched_sportsbook_player"]
-            )
-            exact_key_matched_free_agents[
-                "included_in_ranked_sportsbook_table"
-            ] = exact_key_matched_free_agents.apply(
-                is_ranked_sportsbook_table_candidate,
-                axis=1,
-            )
-            exact_key_matched_free_agents["exclusion_reason"] = (
-                exact_key_matched_free_agents.apply(
-                    lambda row: get_ranked_sportsbook_exclusion_reason(
-                        row,
-                        player_search,
-                    ),
+            if availability_debug_source.empty:
+                st.info("No available hitters are loaded for availability debugging.")
+            else:
+                availability_details = availability_debug_source.apply(
+                    classify_player_availability,
                     axis=1,
+                    result_type="expand",
                 )
-            )
-
-        st.subheader("Exact-Key Matched ESPN Free Agents")
-        st.write(
-            "These rows matched ESPN free agents to sportsbook projections by "
-            "player_match_key. If a matched player is not in the ranked table, "
-            "the exclusion_reason column explains why."
-        )
-        if exact_key_matched_free_agents.empty:
-            st.info("No exact-key matched ESPN free agents found.")
-        else:
-            matched_columns = [
-                column
-                for column in [
-                    "player",
-                    "matched_projection_player",
-                    "projected_fantasy_points",
-                    "projection_source",
-                    "bookmaker_count",
-                    "markets_available",
-                    "has_sportsbook_props",
-                    "has_game_today",
-                    "is_available_today",
-                    "player_type",
-                    "included_in_ranked_sportsbook_table",
-                    "exclusion_reason",
+                availability_debug_source["raw_status_values_checked"] = availability_details[
+                    "raw_status_values_checked"
                 ]
-                if column in exact_key_matched_free_agents.columns
-            ]
-            st.dataframe(
-                clean_dataframe_for_streamlit(
-                    exact_key_matched_free_agents[matched_columns]
-                    .sort_values("projected_fantasy_points", ascending=False)
-                    .round(3)
-                ),
-                width="stretch",
-            )
-
-        st.subheader("Expected Player Match Checks")
-        expected_debug_rows = []
-        for expected_player in ["Tyler Stephenson", "Heriberto Hernandez", "Estury Ruiz"]:
-            expected_key = build_player_match_key(expected_player)
-            espn_rows = (
-                available_source_table[
-                    available_source_table["player_match_key"].eq(expected_key)
+                availability_debug_source["unavailable_marker_detected"] = availability_details[
+                    "unavailable_marker_detected"
                 ]
-                if not available_source_table.empty
-                else pd.DataFrame()
-            )
-            projection_rows = (
-                projection_base_table[
-                    projection_base_table["player_match_key"].eq(expected_key)
+                availability_debug_source["is_available_today"] = ~availability_details[
+                    "is_unavailable"
                 ]
-                if not projection_base_table.empty
-                else pd.DataFrame()
-            )
-            final_rows = (
-                master_pickup_table[
-                    master_pickup_table["player_match_key"].eq(expected_key)
-                    & master_pickup_table["roster_status"].eq("Available")
-                ]
-                if not master_pickup_table.empty
-                else pd.DataFrame()
-            )
-            final_row = final_rows.iloc[0] if not final_rows.empty else {}
-            expected_debug_rows.append(
-                {
-                    "player": expected_player,
-                    "found_in_espn_free_agents": not espn_rows.empty,
-                    "found_in_projection_table": not projection_rows.empty,
-                    "match_method": final_row.get("sportsbook_match_method", ""),
-                    "match_score": final_row.get("sportsbook_match_score", 0),
-                    "matched_projection_player": final_row.get(
-                        "matched_sportsbook_player",
-                        "",
-                    ),
-                    "projected_fantasy_points": final_row.get(
+                debug_columns = [
+                    column
+                    for column in [
+                        "player",
+                        "injury_status",
+                        "status",
+                        "roster_status",
+                        "roster_spot",
+                        "availability_note",
+                        "raw_status_values_checked",
+                        "unavailable_marker_detected",
+                        "is_available_today",
                         "projected_fantasy_points",
-                        "",
+                        "projection_source",
+                    ]
+                    if column in availability_debug_source.columns
+                ]
+                st.dataframe(
+                    clean_top_pickups_dataframe_for_display(
+                        availability_debug_source[debug_columns].head(50).round(3)
                     ),
-                    "projection_source": final_row.get("projection_source", ""),
-                    "has_sportsbook_props": final_row.get("has_sportsbook_props", ""),
-                    "has_game_today": final_row.get("has_game_today", ""),
-                    "is_available_today": final_row.get("is_available_today", ""),
-                    "included_in_ranked_sportsbook_table": (
-                        is_ranked_sportsbook_table_candidate(final_row)
-                        if not final_rows.empty
-                        else False
-                    ),
-                    "exclusion_reason": (
-                        get_ranked_sportsbook_exclusion_reason(
-                            final_row,
-                            player_search,
-                        )
-                        if not final_rows.empty
-                        else (
-                            "not found in ESPN free agents"
-                            if espn_rows.empty
-                            else "not found in projection table"
-                        )
-                    ),
-                }
-            )
-        st.dataframe(
-            clean_dataframe_for_streamlit(pd.DataFrame(expected_debug_rows)),
-            width="stretch",
-        )
+                    width="stretch",
+                )
 
-        debug_player_search = st.text_input(
-            "Search match debug by player",
-            value="",
-            placeholder="Example: Heriberto Hernandez",
-        )
-        if debug_player_search:
-            normalized_search = normalize_player_name(debug_player_search)
-            match_key_search = build_player_match_key(debug_player_search)
-            st.caption(
-                f"Search normalized name: `{normalized_search}` | "
-                f"match key: `{match_key_search}`"
+        with st.expander("Developer Diagnostics - Sportsbook Match Debug", expanded=False):
+            st.write(
+                "This verifies whether ESPN free agents are joining to sportsbook "
+                "projection rows. Matching tries player_match_key first, then "
+                "normalized player name, then fuzzy matching at a safe threshold."
             )
-
-            espn_search_rows = (
-                available_source_table[
-                    available_source_table["player"].str.contains(
-                        debug_player_search,
-                        case=False,
-                        na=False,
-                    )
-                    | (available_source_table["normalized_player_name"] == normalized_search)
-                    | (available_source_table["player_match_key"] == match_key_search)
-                ].copy()
+            available_source_table = (
+                add_player_matching_columns(available_players_dataframe)
+                if available_players_dataframe is not None
+                else pd.DataFrame()
+            )
+            available_source_hitters = (
+                available_source_table[available_source_table.apply(row_is_hitter, axis=1)].copy()
                 if not available_source_table.empty
                 else pd.DataFrame()
             )
-            sportsbook_search_rows = (
-                projection_base_table[
-                    projection_base_table["player"].str.contains(
-                        debug_player_search,
-                        case=False,
-                        na=False,
-                    )
-                    | (projection_base_table["normalized_player_name"] == normalized_search)
-                    | (projection_base_table["player_match_key"] == match_key_search)
-                ].copy()
-                if not projection_base_table.empty
-                else pd.DataFrame()
-            )
-            final_match_rows = (
-                master_pickup_table[
-                    master_pickup_table["player"].str.contains(
-                        debug_player_search,
-                        case=False,
-                        na=False,
-                    )
-                    | (master_pickup_table["normalized_player_name"] == normalized_search)
-                    | (master_pickup_table["player_match_key"] == match_key_search)
-                    | master_pickup_table["matched_sportsbook_player"].astype(str).str.contains(
-                        debug_player_search,
-                        case=False,
-                        na=False,
-                    )
-                ].copy()
-                if not master_pickup_table.empty
-                else pd.DataFrame()
-            )
-            diagnostic_search_rows = (
+            available_diagnostics = (
                 sportsbook_match_diagnostics[
-                    sportsbook_match_diagnostics["espn_player"].astype(str).str.contains(
-                        debug_player_search,
-                        case=False,
-                        na=False,
+                    sportsbook_match_diagnostics["espn_player"].isin(
+                        available_source_hitters["player"]
+                        if not available_source_hitters.empty
+                        else []
                     )
-                    | sportsbook_match_diagnostics["matched_projection_player"]
-                    .astype(str)
-                    .str.contains(debug_player_search, case=False, na=False)
-                    | (sportsbook_match_diagnostics["normalized_player_name"] == normalized_search)
-                    | (sportsbook_match_diagnostics["player_match_key"] == match_key_search)
                 ].copy()
                 if not sportsbook_match_diagnostics.empty
                 else pd.DataFrame()
             )
+            exact_normalized_count = (
+                int((available_diagnostics["match_method"] == "exact normalized name").sum())
+                if not available_diagnostics.empty
+                else 0
+            )
+            exact_key_count = (
+                int((available_diagnostics["match_method"] == "exact match key").sum())
+                if not available_diagnostics.empty
+                else 0
+            )
+            fuzzy_match_count = (
+                int((available_diagnostics["match_method"] == "fuzzy").sum())
+                if not available_diagnostics.empty
+                else 0
+            )
+            unmatched_espn_free_agents = (
+                int((~as_bool_series(available_diagnostics["has_sportsbook_props"])).sum())
+                if not available_diagnostics.empty
+                else len(available_source_hitters)
+            )
 
-            st.subheader("ESPN Row")
-            if espn_search_rows.empty:
-                if not sportsbook_search_rows.empty:
-                    st.warning(
-                        "This player exists in the sportsbook projection table, "
-                        "but was not found in the ESPN free-agent table."
+            debug_metrics = st.columns(7)
+            debug_metrics[0].metric(
+                "Sportsbook Projection Rows",
+                len(sportsbook_projection_table),
+            )
+            debug_metrics[1].metric(
+                "ESPN FA Hitter Rows",
+                len(available_source_hitters),
+            )
+            debug_metrics[2].metric("Exact Key Matches", exact_key_count)
+            debug_metrics[3].metric(
+                "Exact Normalized Matches",
+                exact_normalized_count,
+            )
+            debug_metrics[4].metric("Fuzzy Matches", fuzzy_match_count)
+            debug_metrics[5].metric(
+                "Unmatched ESPN FAs",
+                unmatched_espn_free_agents,
+            )
+            debug_metrics[6].metric(
+                "Unmatched Sportsbook Players",
+                profile_counts["unmatched_sportsbook_projection_players"],
+            )
+
+            exact_key_matched_free_agents = master_pickup_table[
+                (master_pickup_table["roster_status"] == "Available")
+                & master_pickup_table["sportsbook_match_method"].astype(str).eq(
+                    "exact match key"
+                )
+            ].copy()
+            if not exact_key_matched_free_agents.empty:
+                exact_key_matched_free_agents["matched_projection_player"] = (
+                    exact_key_matched_free_agents["matched_sportsbook_player"]
+                )
+                exact_key_matched_free_agents[
+                    "included_in_ranked_sportsbook_table"
+                ] = exact_key_matched_free_agents.apply(
+                    is_ranked_sportsbook_table_candidate,
+                    axis=1,
+                )
+                exact_key_matched_free_agents["exclusion_reason"] = (
+                    exact_key_matched_free_agents.apply(
+                        lambda row: get_ranked_sportsbook_exclusion_reason(
+                            row,
+                            player_search,
+                        ),
+                        axis=1,
                     )
-                else:
-                    st.info("No ESPN free-agent row matched that search.")
-            else:
-                st.dataframe(
-                    clean_dataframe_for_streamlit(espn_search_rows),
-                    width="stretch",
                 )
 
-            st.subheader("Sportsbook Projection Row")
-            if sportsbook_search_rows.empty:
-                if not espn_search_rows.empty:
-                    st.warning(
-                        "This player exists in ESPN free agents, but was not "
-                        "found in the sportsbook projection table."
-                    )
-                else:
-                    st.info("No sportsbook projection row matched that search.")
+            st.subheader("Exact-Key Matched ESPN Free Agents")
+            st.write(
+                "These rows matched ESPN free agents to sportsbook projections by "
+                "player_match_key. If a matched player is not in the ranked table, "
+                "the exclusion_reason column explains why."
+            )
+            if exact_key_matched_free_agents.empty:
+                st.info("No exact-key matched ESPN free agents found.")
             else:
+                matched_columns = [
+                    column
+                    for column in [
+                        "player",
+                        "matched_projection_player",
+                        "projected_fantasy_points",
+                        "projection_source",
+                        "bookmaker_count",
+                        "markets_available",
+                        "has_sportsbook_props",
+                        "has_game_today",
+                        "is_available_today",
+                        "player_type",
+                        "included_in_ranked_sportsbook_table",
+                        "exclusion_reason",
+                    ]
+                    if column in exact_key_matched_free_agents.columns
+                ]
                 st.dataframe(
-                    clean_dataframe_for_streamlit(
-                        sportsbook_search_rows[
-                            [
-                                column
-                                for column in [
-                                    "player",
-                                    "normalized_player_name",
-                                    "player_match_key",
-                                    "projected_fantasy_points",
-                                    "projection_source",
-                                    "bookmaker_count",
-                                    "markets_available",
-                                    "has_sportsbook_props",
-                                ]
-                                if column in sportsbook_search_rows.columns
-                            ]
-                        ].round(3)
+                    clean_top_pickups_dataframe_for_display(
+                        exact_key_matched_free_agents[matched_columns]
+                        .sort_values("projected_fantasy_points", ascending=False)
+                        .round(3)
                     ),
                     width="stretch",
                 )
 
-            st.subheader("Match Result")
-            if diagnostic_search_rows.empty and final_match_rows.empty:
-                st.info("No final match result found for that search.")
-            else:
-                if not diagnostic_search_rows.empty:
-                    st.dataframe(
-                        clean_dataframe_for_streamlit(diagnostic_search_rows),
-                        width="stretch",
-                    )
-                if not final_match_rows.empty:
-                    final_match_rows["filter_reason"] = final_match_rows.apply(
-                        lambda row: get_available_hitter_filter_reason(
-                            row,
-                            include_unavailable_players,
-                            include_players_without_games,
-                            include_stat_fallback_only_hitters,
-                        ),
-                        axis=1,
-                    )
-                    final_columns = [
-                        column
-                        for column in [
-                            "player",
-                            "espn_player_id",
-                            "normalized_player_name",
-                            "player_match_key",
-                            "matched_sportsbook_player",
-                            "sportsbook_match_method",
-                            "sportsbook_match_score",
-                            "projected_fantasy_points",
-                            "projection_source",
-                            "bookmaker_count",
-                            "markets_available",
-                            "has_sportsbook_props",
-                            "has_game_today",
-                            "is_available_today",
-                            "filter_reason",
-                        ]
-                        if column in final_match_rows.columns
+            st.subheader("Expected Player Match Checks")
+            expected_debug_rows = []
+            for expected_player in ["Tyler Stephenson", "Heriberto Hernandez", "Estury Ruiz"]:
+                expected_key = build_player_match_key(expected_player)
+                espn_rows = (
+                    available_source_table[
+                        available_source_table["player_match_key"].eq(expected_key)
                     ]
+                    if not available_source_table.empty
+                    else pd.DataFrame()
+                )
+                projection_rows = (
+                    projection_base_table[
+                        projection_base_table["player_match_key"].eq(expected_key)
+                    ]
+                    if not projection_base_table.empty
+                    else pd.DataFrame()
+                )
+                final_rows = (
+                    master_pickup_table[
+                        master_pickup_table["player_match_key"].eq(expected_key)
+                        & master_pickup_table["roster_status"].eq("Available")
+                    ]
+                    if not master_pickup_table.empty
+                    else pd.DataFrame()
+                )
+                final_row = final_rows.iloc[0] if not final_rows.empty else {}
+                expected_debug_rows.append(
+                    {
+                        "player": expected_player,
+                        "found_in_espn_free_agents": not espn_rows.empty,
+                        "found_in_projection_table": not projection_rows.empty,
+                        "match_method": final_row.get("sportsbook_match_method", ""),
+                        "match_score": final_row.get("sportsbook_match_score", 0),
+                        "matched_projection_player": final_row.get(
+                            "matched_sportsbook_player",
+                            "",
+                        ),
+                        "projected_fantasy_points": final_row.get(
+                            "projected_fantasy_points",
+                            0,
+                        ),
+                        "projection_source": final_row.get("projection_source", ""),
+                        "has_sportsbook_props": final_row.get("has_sportsbook_props", ""),
+                        "has_game_today": final_row.get("has_game_today", ""),
+                        "is_available_today": final_row.get("is_available_today", ""),
+                        "included_in_ranked_sportsbook_table": (
+                            is_ranked_sportsbook_table_candidate(final_row)
+                            if not final_rows.empty
+                            else False
+                        ),
+                        "exclusion_reason": (
+                            get_ranked_sportsbook_exclusion_reason(
+                                final_row,
+                                player_search,
+                            )
+                            if not final_rows.empty
+                            else (
+                                "not found in ESPN free agents"
+                                if espn_rows.empty
+                                else "not found in projection table"
+                            )
+                        ),
+                    }
+                )
+            st.dataframe(
+                clean_top_pickups_dataframe_for_display(
+                    normalize_display_numeric_columns(pd.DataFrame(expected_debug_rows))
+                ),
+                width="stretch",
+            )
+
+            debug_player_search = st.text_input(
+                "Search match debug by player",
+                value="",
+                placeholder="Example: Heriberto Hernandez",
+            )
+            if debug_player_search:
+                normalized_search = normalize_player_name(debug_player_search)
+                match_key_search = build_player_match_key(debug_player_search)
+                st.caption(
+                    f"Search normalized name: `{normalized_search}` | "
+                    f"match key: `{match_key_search}`"
+                )
+
+                espn_search_rows = (
+                    available_source_table[
+                        available_source_table["player"].str.contains(
+                            debug_player_search,
+                            case=False,
+                            na=False,
+                        )
+                        | (available_source_table["normalized_player_name"] == normalized_search)
+                        | (available_source_table["player_match_key"] == match_key_search)
+                    ].copy()
+                    if not available_source_table.empty
+                    else pd.DataFrame()
+                )
+                sportsbook_search_rows = (
+                    projection_base_table[
+                        projection_base_table["player"].str.contains(
+                            debug_player_search,
+                            case=False,
+                            na=False,
+                        )
+                        | (projection_base_table["normalized_player_name"] == normalized_search)
+                        | (projection_base_table["player_match_key"] == match_key_search)
+                    ].copy()
+                    if not projection_base_table.empty
+                    else pd.DataFrame()
+                )
+                final_match_rows = (
+                    master_pickup_table[
+                        master_pickup_table["player"].str.contains(
+                            debug_player_search,
+                            case=False,
+                            na=False,
+                        )
+                        | (master_pickup_table["normalized_player_name"] == normalized_search)
+                        | (master_pickup_table["player_match_key"] == match_key_search)
+                        | master_pickup_table["matched_sportsbook_player"].astype(str).str.contains(
+                            debug_player_search,
+                            case=False,
+                            na=False,
+                        )
+                    ].copy()
+                    if not master_pickup_table.empty
+                    else pd.DataFrame()
+                )
+                diagnostic_search_rows = (
+                    sportsbook_match_diagnostics[
+                        sportsbook_match_diagnostics["espn_player"].astype(str).str.contains(
+                            debug_player_search,
+                            case=False,
+                            na=False,
+                        )
+                        | sportsbook_match_diagnostics["matched_projection_player"]
+                        .astype(str)
+                        .str.contains(debug_player_search, case=False, na=False)
+                        | (sportsbook_match_diagnostics["normalized_player_name"] == normalized_search)
+                        | (sportsbook_match_diagnostics["player_match_key"] == match_key_search)
+                    ].copy()
+                    if not sportsbook_match_diagnostics.empty
+                    else pd.DataFrame()
+                )
+
+                st.subheader("ESPN Row")
+                if espn_search_rows.empty:
+                    if not sportsbook_search_rows.empty:
+                        st.warning(
+                            "This player exists in the sportsbook projection table, "
+                            "but was not found in the ESPN free-agent table."
+                        )
+                    else:
+                        st.info("No ESPN free-agent row matched that search.")
+                else:
                     st.dataframe(
-                        clean_dataframe_for_streamlit(
-                            final_match_rows[final_columns].round(3)
+                        clean_top_pickups_dataframe_for_display(espn_search_rows),
+                        width="stretch",
+                    )
+
+                st.subheader("Sportsbook Projection Row")
+                if sportsbook_search_rows.empty:
+                    if not espn_search_rows.empty:
+                        st.warning(
+                            "This player exists in ESPN free agents, but was not "
+                            "found in the sportsbook projection table."
+                        )
+                    else:
+                        st.info("No sportsbook projection row matched that search.")
+                else:
+                    st.dataframe(
+                        clean_top_pickups_dataframe_for_display(
+                            sportsbook_search_rows[
+                                [
+                                    column
+                                    for column in [
+                                        "player",
+                                        "normalized_player_name",
+                                        "player_match_key",
+                                        "projected_fantasy_points",
+                                        "projection_source",
+                                        "bookmaker_count",
+                                        "markets_available",
+                                        "has_sportsbook_props",
+                                    ]
+                                    if column in sportsbook_search_rows.columns
+                                ]
+                            ].round(3)
                         ),
                         width="stretch",
                     )
-        elif sportsbook_match_diagnostics.empty:
-            st.info("No match diagnostics are available.")
+
+                st.subheader("Match Result")
+                if diagnostic_search_rows.empty and final_match_rows.empty:
+                    st.info("No final match result found for that search.")
+                else:
+                    if not diagnostic_search_rows.empty:
+                        st.dataframe(
+                            clean_top_pickups_dataframe_for_display(diagnostic_search_rows),
+                            width="stretch",
+                        )
+                    if not final_match_rows.empty:
+                        final_match_rows["filter_reason"] = final_match_rows.apply(
+                            lambda row: get_available_hitter_filter_reason(
+                                row,
+                                include_unavailable_players,
+                                include_players_without_games,
+                                include_stat_fallback_only_hitters,
+                            ),
+                            axis=1,
+                        )
+                        final_columns = [
+                            column
+                            for column in [
+                                "player",
+                                "espn_player_id",
+                                "normalized_player_name",
+                                "player_match_key",
+                                "matched_sportsbook_player",
+                                "sportsbook_match_method",
+                                "sportsbook_match_score",
+                                "projected_fantasy_points",
+                                "projection_source",
+                                "bookmaker_count",
+                                "markets_available",
+                                "has_sportsbook_props",
+                                "has_game_today",
+                                "is_available_today",
+                                "filter_reason",
+                            ]
+                            if column in final_match_rows.columns
+                        ]
+                        st.dataframe(
+                            clean_top_pickups_dataframe_for_display(
+                                final_match_rows[final_columns].round(3)
+                            ),
+                            width="stretch",
+                        )
+            elif sportsbook_match_diagnostics.empty:
+                st.info("No match diagnostics are available.")
 
     if has_roster_data and show_roster_protection_review:
-        with st.expander("Roster Protection Review"):
+        with st.expander("Roster Protection / Droppable Review", expanded=False):
             st.write(
                 "The optimizer only suggests dropping players marked droppable "
                 "or streamable. Protected, Core, IL, and unavailable players are not dropped."
             )
-            st.dataframe(
-                clean_dataframe_for_streamlit(
-                    build_roster_protection_review(
-                        roster_group_table if not roster_group_table.empty else roster_dataframe
-                    )
-                ),
-                width="stretch",
-            )
-
-    if has_roster_data:
-        with st.expander("Droppable Candidate Review"):
             review = build_roster_protection_review(
                 roster_group_table if not roster_group_table.empty else roster_dataframe
             )
-            st.dataframe(clean_dataframe_for_streamlit(review), width="stretch")
+            st.dataframe(clean_top_pickups_dataframe_for_display(review), width="stretch")
 
-    if has_roster_data or has_available_data:
-        with st.expander("Projection Coverage Review"):
+    if show_developer_diagnostics:
+        if has_roster_data or has_available_data:
+            with st.expander("Projection Coverage Review"):
+                st.write(
+                    "This separates sportsbook-line projections from fallback or "
+                    "missing projections so empty recommendation sections are easier to diagnose."
+                )
+                st.dataframe(
+                    clean_top_pickups_dataframe_for_display(
+                        build_projection_coverage_review(master_pickup_table).round(3)
+                    ),
+                    width="stretch",
+                )
+        if has_roster_data and has_available_data:
+            with st.expander("Replacement Value by Position"):
+                phase_start = perf_counter()
+                show_replacement_value_by_position(
+                    roster_projection_table,
+                    reduced_available_projection_table,
+                    master_pickup_table,
+                )
+                log_timing(timing_rows, "Replacement value generation", phase_start)
+        else:
+            with st.expander("Replacement Value by Position"):
+                st.info("Load both roster and available-player data to compare replacement value.")
+
+        with st.expander("Final Performance Timing Log"):
             st.write(
-                "This separates sportsbook-line projections from fallback or "
-                "missing projections so empty recommendation sections are easier to diagnose."
+                "This includes lower-page work such as replacement value generation."
+            )
+            timing_rows.append(
+                {
+                    "phase": "Total Top Pickups render",
+                    "seconds": round(perf_counter() - page_start_time, 3),
+                }
             )
             st.dataframe(
-                clean_dataframe_for_streamlit(
-                    build_projection_coverage_review(master_pickup_table).round(3)
-                ),
+                clean_top_pickups_dataframe_for_display(pd.DataFrame(timing_rows)),
                 width="stretch",
             )
-    if has_roster_data and has_available_data:
-        with st.expander("Replacement Value by Position"):
-            phase_start = perf_counter()
-            show_replacement_value_by_position(
-                roster_projection_table,
-                reduced_available_projection_table,
-                master_pickup_table,
-            )
-            log_timing(timing_rows, "Replacement value generation", phase_start)
-    else:
-        with st.expander("Replacement Value by Position"):
-            st.info("Load both roster and available-player data to compare replacement value.")
-
-    with st.expander("Final Performance Timing Log"):
-        st.write(
-            "This includes lower-page work such as replacement value generation."
-        )
-        timing_rows.append(
-            {
-                "phase": "Total Top Pickups render",
-                "seconds": round(perf_counter() - page_start_time, 3),
-            }
-        )
-        st.dataframe(
-            clean_dataframe_for_streamlit(pd.DataFrame(timing_rows)),
-            width="stretch",
-        )
 
 except MissingOddsAPIKeyError as error:
     st.warning(str(error))
