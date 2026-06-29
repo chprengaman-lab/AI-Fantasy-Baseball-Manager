@@ -9,6 +9,7 @@ import pandas as pd
 import streamlit as st
 
 from services.fantasy_scoring import calculate_fantasy_points
+from utils.streamlit_dataframe import clean_dataframe_for_streamlit
 
 
 st.title("Player Projections")
@@ -168,4 +169,4 @@ display_dataframe = projections_dataframe.round(2)
 
 
 # Show the projection table in the Streamlit page.
-st.dataframe(display_dataframe, width="stretch")
+st.dataframe(clean_dataframe_for_streamlit(display_dataframe), width="stretch")

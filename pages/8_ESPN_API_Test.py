@@ -22,6 +22,7 @@ from services.espn_fantasy import (
     load_espn_config_from_env,
     normalize_espn_player,
 )
+from utils.streamlit_dataframe import clean_dataframe_for_streamlit
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -264,14 +265,20 @@ def render_cached_espn_data(cached_data: dict) -> None:
     st.subheader("My Normalized Roster")
 
     if not roster_dataframe.empty:
-        st.dataframe(roster_dataframe, width="stretch")
+        st.dataframe(
+            clean_dataframe_for_streamlit(roster_dataframe),
+            width="stretch",
+        )
     else:
         st.info("No roster players were returned for this ESPN team.")
 
     st.subheader("League Teams")
 
     if not teams_dataframe.empty:
-        st.dataframe(teams_dataframe, width="stretch")
+        st.dataframe(
+            clean_dataframe_for_streamlit(teams_dataframe),
+            width="stretch",
+        )
     else:
         st.info("No league teams were returned by ESPN.")
 
@@ -298,6 +305,10 @@ def render_cached_espn_data(cached_data: dict) -> None:
             "player_type",
             "pro_team",
             "injury_status",
+            "status",
+            "player_notes",
+            "lineup_status",
+            "fantasy_status",
         ]
         available_columns = [
             column
@@ -306,7 +317,7 @@ def render_cached_espn_data(cached_data: dict) -> None:
         ]
 
         st.dataframe(
-            filtered_free_agents[available_columns],
+            clean_dataframe_for_streamlit(filtered_free_agents[available_columns]),
             width="stretch",
         )
     else:

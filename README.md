@@ -137,9 +137,9 @@ Daily hitter starting slots:
 
 Roster settings:
 
-- 17 active roster spots
+- 19 active roster spots: 9 starting hitters, 4 bench hitters, 4 SP, and 2 RP
 - 4 IL spots
-- Max 5 SP on the active roster
+- Max 4 SP on the active roster
 - Max 2 RP on the active roster
 - No add/drop limit
 - SP starts are capped at 5 per week

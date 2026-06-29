@@ -38,8 +38,13 @@ PLAYER_STATS_COLUMNS = [
     "rbi",
     "runs",
     "stolen_bases",
+    "caught_stealing",
     "strikeouts",
     "strikeout_rate",
+    "hit_by_pitch",
+    "intentional_walks",
+    "sacrifices",
+    "ground_into_double_play",
 ]
 
 
@@ -183,8 +188,13 @@ def normalize_hitting_stats(raw_stats: pd.DataFrame) -> pd.DataFrame:
     _copy_column(raw_stats, stats_dataframe, "rbi", ["RBI"])
     _copy_column(raw_stats, stats_dataframe, "runs", ["R", "Runs"])
     _copy_column(raw_stats, stats_dataframe, "stolen_bases", ["SB", "Stolen Bases"])
+    _copy_column(raw_stats, stats_dataframe, "caught_stealing", ["CS"])
     _copy_column(raw_stats, stats_dataframe, "strikeouts", ["SO", "K", "Strikeouts"])
     _copy_column(raw_stats, stats_dataframe, "strikeout_rate", ["K%", "SO%", "KRate"])
+    _copy_column(raw_stats, stats_dataframe, "hit_by_pitch", ["HBP"])
+    _copy_column(raw_stats, stats_dataframe, "intentional_walks", ["IBB"])
+    _copy_column(raw_stats, stats_dataframe, "sacrifices", ["SF", "SH"])
+    _copy_column(raw_stats, stats_dataframe, "ground_into_double_play", ["GDP", "GIDP"])
 
     if "player" not in stats_dataframe.columns:
         raise PlayerStatsError("pybaseball stats did not include player names.")

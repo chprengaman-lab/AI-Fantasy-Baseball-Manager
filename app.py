@@ -16,6 +16,7 @@ from services.odds_api import (
     get_odds_api_key_debug_info,
     get_odds_data_source_status,
 )
+from utils.streamlit_dataframe import clean_dataframe_for_streamlit
 from utils.streamlit_debug import show_odds_api_error_debug
 
 
@@ -74,7 +75,7 @@ try:
         st.caption(f"Data source: {odds_source}")
 
     if display_events:
-        st.dataframe(display_events, width="stretch")
+        st.dataframe(clean_dataframe_for_streamlit(display_events), width="stretch")
     else:
         st.info("No MLB games found for today.")
 except MissingOddsAPIKeyError as error:

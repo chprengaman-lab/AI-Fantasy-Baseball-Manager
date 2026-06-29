@@ -183,13 +183,14 @@ def get_my_espn_roster(league, team_id=None) -> list[dict]:
 def get_espn_free_agents(
     league,
     position: str | None = None,
-    size: int = 100,
+    size: int = 500,
 ) -> list[dict]:
     """Return normalized free-agent rows from espn-api."""
 
     try:
-        # espn-api handles the ESPN request for us. We ask for a limited
-        # number of players so this experimental page stays responsive.
+        # espn-api handles the ESPN request for us. We default to a larger pool
+        # because the top overall free agents can include many pitchers before
+        # enough streamable hitters appear.
         free_agents = league.free_agents(size=size, position=position)
     except Exception as error:
         raise ESPNFantasyError(
@@ -249,6 +250,22 @@ def normalize_espn_player(
         "injury_status": _get_first_existing_attribute(
             player,
             ["injuryStatus", "injury_status"],
+        ),
+        "status": _get_first_existing_attribute(
+            player,
+            ["status", "playerStatus"],
+        ),
+        "player_notes": _get_first_existing_attribute(
+            player,
+            ["player_notes", "playerNotes", "news", "notes"],
+        ),
+        "lineup_status": _get_first_existing_attribute(
+            player,
+            ["lineup_status", "lineupStatus", "lineupSlot"],
+        ),
+        "fantasy_status": _get_first_existing_attribute(
+            player,
+            ["fantasy_status", "fantasyStatus", "availabilityStatus"],
         ),
         "fantasy_team": fantasy_team or "",
     }

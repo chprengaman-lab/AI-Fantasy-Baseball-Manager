@@ -23,6 +23,11 @@ def american_odds_to_implied_probability(american_odds: int | float | None) -> f
     if american_odds is None:
         return None
 
+    try:
+        american_odds = float(american_odds)
+    except (TypeError, ValueError):
+        return None
+
     if american_odds > 0:
         return 100 / (american_odds + 100)
 

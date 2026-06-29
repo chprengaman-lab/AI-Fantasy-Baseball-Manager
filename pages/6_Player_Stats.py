@@ -8,6 +8,7 @@ import pandas as pd
 import streamlit as st
 
 from services.player_stats import PlayerStatsError, fetch_season_to_date_hitting_stats
+from utils.streamlit_dataframe import clean_dataframe_for_streamlit
 
 
 @st.cache_data(ttl=60 * 60)
@@ -74,6 +75,6 @@ try:
         lambda value: f"{value:.1%}" if pd.notna(value) else ""
     )
 
-    st.dataframe(display_dataframe, width="stretch")
+    st.dataframe(clean_dataframe_for_streamlit(display_dataframe), width="stretch")
 except PlayerStatsError as error:
     st.error(str(error))

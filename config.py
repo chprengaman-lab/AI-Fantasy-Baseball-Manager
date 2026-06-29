@@ -67,9 +67,9 @@ LEAGUE_SCORING = {
 # will be used by the future lineup optimizer.
 LEAGUE_RULES = {
     "hitter_starting_slots": ["C", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "DH"],
-    "active_roster_spots": 17,
+    "active_roster_spots": 19,
     "il_spots": 4,
-    "max_sp": 5,
+    "max_sp": 4,
     "max_rp": 2,
     "weekly_sp_start_cap": 5,
     "rp_max_counting_innings": 2,

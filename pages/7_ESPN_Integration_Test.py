@@ -9,6 +9,7 @@ from services.espn_fantasy import (
     extract_teams_from_league_data,
     fetch_espn_league_data,
 )
+from utils.streamlit_dataframe import clean_dataframe_for_streamlit
 
 
 def show_espn_error_debug(debug_info: dict) -> None:
@@ -133,14 +134,20 @@ if st.button("Test ESPN Connection"):
         st.subheader("Teams")
 
         if teams:
-            st.dataframe(pd.DataFrame(teams), width="stretch")
+            st.dataframe(
+                clean_dataframe_for_streamlit(pd.DataFrame(teams)),
+                width="stretch",
+            )
         else:
             st.info("No teams table could be extracted from the ESPN response.")
 
         st.subheader("Selected Team Roster")
 
         if roster:
-            st.dataframe(pd.DataFrame(roster), width="stretch")
+            st.dataframe(
+                clean_dataframe_for_streamlit(pd.DataFrame(roster)),
+                width="stretch",
+            )
         else:
             st.info(
                 "No roster could be extracted for that team_id. Check the team "

@@ -8,9 +8,11 @@ from itertools import combinations
 import re
 
 import pandas as pd
+from scipy.optimize import linear_sum_assignment
 
 from config import LEAGUE_RULES
 from services.player_stats import normalize_player_name
+from utils.player_availability import is_player_unavailable
 
 
 def normalize_position(position) -> str:
@@ -89,9 +91,12 @@ def _empty_lineup_result(players_df: pd.DataFrame, warning_message: str):
             "roster_slot",
             "player",
             "eligible_positions",
+            "roster_spot",
             "projected_fantasy_points",
             "projection_source",
             "projection_confidence",
+            "injury_status",
+            "availability_note",
         ]
     )
     bench_df = players_df.copy()
@@ -123,7 +128,7 @@ def _is_il_roster_spot(roster_spot) -> bool:
     if not isinstance(roster_spot, str):
         return False
 
-    return normalize_position(roster_spot) == "IL"
+    return normalize_position(roster_spot).startswith("IL")
 
 
 def is_il_player(row) -> bool:
@@ -138,23 +143,33 @@ def _is_bench_roster_spot(roster_spot) -> bool:
     if not isinstance(roster_spot, str):
         return False
 
-    return normalize_position(roster_spot) == "BENCH"
+    return normalize_position(roster_spot) in {"BENCH", "BE"}
 
 
 def infer_player_type(row) -> str:
     """Infer player type from CSV data.
 
-    If player_type exists, use it. If it is missing, infer from
-    eligible_positions:
-    - SP means starting pitcher
-    - RP means relief pitcher
-    - otherwise treat the player as a hitter
+    Roster usage is not the same as eligibility. A reliever can have SP
+    eligibility in ESPN, but if his current roster spot is RP, he should count
+    as RP for roster construction. We therefore prefer roster_spot/current slot,
+    then explicit player_type, and only use eligible_positions as a last resort.
     """
+
+    roster_spot = normalize_position(row.get("roster_spot", ""))
+
+    if roster_spot == "SP":
+        return "SP"
+
+    if roster_spot == "RP":
+        return "RP"
 
     explicit_player_type = row.get("player_type", "")
 
     if isinstance(explicit_player_type, str) and explicit_player_type.strip():
-        return normalize_position(explicit_player_type)
+        normalized_player_type = normalize_position(explicit_player_type)
+
+        if normalized_player_type in {"SP", "RP", "HITTER"}:
+            return normalized_player_type
 
     eligible_positions = parse_eligible_positions(row.get("eligible_positions", ""))
 
@@ -241,7 +256,7 @@ def get_roster_flexibility_summary(roster_df: pd.DataFrame) -> dict:
 
     if sp_count < sp_limit:
         flexibility_notes.append(
-            "You are carrying fewer than 5 SP, which may create hitter "
+            f"You are carrying fewer than {sp_limit} SP, which may create hitter "
             "streaming flexibility."
         )
 
@@ -306,6 +321,14 @@ def _enrich_players_with_projection(
         "eligible_positions",
         "projected_fantasy_points",
         "projection_source",
+        "injury_status",
+        "availability_note",
+        "roster_spot",
+        "status",
+        "is_available_today",
+        "espn_player_id",
+        "player_match_key",
+        "normalized_player_name",
     ]
 
     if players_df is None or players_df.empty or "player" not in players_df.columns:
@@ -320,22 +343,26 @@ def _enrich_players_with_projection(
 
         # Players without a projection are kept at 0 and marked Missing so the
         # replacement table does not silently treat missing data as real value.
-        enriched_rows.append(
-            {
-                "player": player_name,
-                "eligible_positions": _get_position_value(player_row),
-                "projected_fantasy_points": projection_row.get(
-                    "projected_fantasy_points",
-                    0,
-                ),
-                "projection_source": projection_row.get(
-                    "projection_source",
-                    "Missing",
-                ),
-            }
+        enriched_row = player_row.to_dict()
+        enriched_row["player"] = player_name
+        enriched_row["eligible_positions"] = _get_position_value(player_row)
+        enriched_row["projected_fantasy_points"] = projection_row.get(
+            "projected_fantasy_points",
+            0,
         )
+        enriched_row["projection_source"] = projection_row.get(
+            "projection_source",
+            "Missing",
+        )
+        enriched_rows.append(enriched_row)
 
-    return pd.DataFrame(enriched_rows, columns=output_columns)
+    enriched_dataframe = pd.DataFrame(enriched_rows)
+
+    for column in output_columns:
+        if column not in enriched_dataframe.columns:
+            enriched_dataframe[column] = ""
+
+    return enriched_dataframe
 
 
 def _get_best_player_for_position(
@@ -402,54 +429,57 @@ def calculate_replacement_value_by_position(
     available_df: pd.DataFrame,
     projections_df: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Compare rostered and available hitters at each exact starting position.
+    """Compare optimized roster lineup vs optimized available-only lineup.
 
-    This helps identify whether a position is worth protecting or whether
-    waiver players are close enough in projected value to stream. Eligibility is
-    exact: LF, CF, RF, and DH only match when that exact position is listed.
+    The old single-position lookup could reuse one available player at several
+    positions. This optimized version runs the same lineup optimizer on
+    available hitters, so each player can only appear once.
     """
 
     output_columns = [
-        "position",
-        "best_rostered_player",
-        "best_rostered_projected_points",
-        "best_rostered_projection_source",
+        "roster_slot",
+        "current_player",
+        "current_projected_points",
         "best_available_player",
         "best_available_projected_points",
-        "best_available_projection_source",
         "replacement_gap",
         "position_status",
     ]
     projection_lookup = _build_projection_lookup(projections_df)
     roster_players = _enrich_players_with_projection(roster_df, projection_lookup)
     available_players = _enrich_players_with_projection(available_df, projection_lookup)
-    replacement_rows = []
+    roster_players = roster_players[
+        ~roster_players.apply(is_player_unavailable, axis=1)
+    ].copy()
+    available_players = available_players[
+        ~available_players.apply(is_player_unavailable, axis=1)
+    ].copy()
+    current_lineup_df, _, _ = optimize_hitter_lineup(roster_players)
+    available_lineup_df, _, _ = optimize_hitter_lineup(available_players)
+    current_lookup = {
+        row["roster_slot"]: row
+        for _, row in current_lineup_df.iterrows()
+    }
+    available_lookup = {
+        row["roster_slot"]: row
+        for _, row in available_lineup_df.iterrows()
+    }
 
+    replacement_rows = []
     for roster_slot in get_hitter_starting_slots():
-        best_rostered = _get_best_player_for_position(roster_players, roster_slot)
-        best_available = _get_best_player_for_position(available_players, roster_slot)
-        replacement_gap = (
-            best_rostered["projected_fantasy_points"]
-            - best_available["projected_fantasy_points"]
-        )
+        current_player = current_lookup.get(roster_slot, {})
+        available_player = available_lookup.get(roster_slot, {})
+        current_points = float(current_player.get("projected_fantasy_points", 0))
+        available_points = float(available_player.get("projected_fantasy_points", 0))
+        replacement_gap = current_points - available_points
 
         replacement_rows.append(
             {
-                "position": roster_slot,
-                "best_rostered_player": best_rostered["player"],
-                "best_rostered_projected_points": best_rostered[
-                    "projected_fantasy_points"
-                ],
-                "best_rostered_projection_source": best_rostered[
-                    "projection_source"
-                ],
-                "best_available_player": best_available["player"],
-                "best_available_projected_points": best_available[
-                    "projected_fantasy_points"
-                ],
-                "best_available_projection_source": best_available[
-                    "projection_source"
-                ],
+                "roster_slot": roster_slot,
+                "current_player": current_player.get("player", ""),
+                "current_projected_points": current_points,
+                "best_available_player": available_player.get("player", ""),
+                "best_available_projected_points": available_points,
                 "replacement_gap": replacement_gap,
                 "position_status": _interpret_replacement_gap(replacement_gap),
             }
@@ -462,14 +492,17 @@ def has_open_active_roster_spot(roster_df: pd.DataFrame) -> bool:
     """Return True when the active roster has room for another player.
 
     Carrying fewer SP than the maximum can create hitter streaming flexibility
-    because the active roster limit is 17 and you do not need to fill every
+    because the active roster limit is configurable and you do not need to fill every
     pitcher maximum slot.
     """
 
     return get_roster_flexibility_summary(roster_df)["can_add_without_drop"]
 
 
-def is_droppable_player(player_row) -> bool:
+def is_droppable_player(
+    player_row,
+    treat_bench_hitters_as_droppable: bool = True,
+) -> bool:
     """Return True when a roster player can safely be dropped.
 
     Rules:
@@ -482,7 +515,10 @@ def is_droppable_player(player_row) -> bool:
     - If droppable is blank or missing, protect the player by default.
     """
 
-    drop_status, _ = get_drop_protection_status(player_row)
+    drop_status, _ = get_drop_protection_status(
+        player_row,
+        treat_bench_hitters_as_droppable=treat_bench_hitters_as_droppable,
+    )
 
     return drop_status == "Droppable"
 
@@ -496,7 +532,10 @@ def _clean_roster_label(value) -> str:
     return re.sub(r"\s+", " ", value.strip()).upper()
 
 
-def get_drop_protection_status(player_row) -> tuple[str, str]:
+def get_drop_protection_status(
+    player_row,
+    treat_bench_hitters_as_droppable: bool = True,
+) -> tuple[str, str]:
     """Explain whether a roster player can be dropped.
 
     The Top Pickups page uses this helper to make the optimizer's drop logic
@@ -512,12 +551,19 @@ def get_drop_protection_status(player_row) -> tuple[str, str]:
 
     keeper_status = _clean_roster_label(player_row.get("keeper_status", ""))
     long_term_value = _clean_roster_label(player_row.get("long_term_value", ""))
+    roster_spot = normalize_position(player_row.get("roster_spot", ""))
 
     if keeper_status == "CORE":
         return "Undroppable", "Keeper status is Core"
 
     if _is_truthy(player_row.get("droppable", "")):
         return "Droppable", "Marked droppable in roster CSV"
+
+    if is_player_unavailable(player_row):
+        return (
+            "Protected by Default",
+            "Player is unavailable or injured and is only droppable when explicitly marked droppable",
+        )
 
     if long_term_value == "HIGH":
         return (
@@ -527,6 +573,18 @@ def get_drop_protection_status(player_row) -> tuple[str, str]:
 
     if keeper_status in {"DROP CANDIDATE", "STREAMER"}:
         return "Droppable", f"Keeper status is {player_row.get('keeper_status')}"
+
+    if (
+        treat_bench_hitters_as_droppable
+        and
+        infer_player_type(player_row) == "HITTER"
+        and roster_spot in {"BE", "BENCH"}
+        and long_term_value in {"", "LOW", "MEDIUM"}
+    ):
+        return (
+            "Droppable",
+            "Bench hitter treated as droppable by safety setting and no explicit protection",
+        )
 
     return (
         "Protected by Default",
@@ -550,6 +608,18 @@ def get_drop_risk(player_row) -> str:
         return "Low"
 
     return ""
+
+
+def _get_optimizer_player_identity(player_row) -> str:
+    """Choose a stable player identity so one player cannot fill two slots."""
+
+    for column in ["espn_player_id", "player_match_key", "normalized_player_name"]:
+        value = player_row.get(column, "")
+
+        if pd.notna(value) and str(value).strip():
+            return f"{column}:{str(value).strip()}"
+
+    return f"player:{normalize_player_name(player_row.get('player', ''))}"
 
 
 def optimize_hitter_lineup(players_df: pd.DataFrame):
@@ -584,70 +654,63 @@ def optimize_hitter_lineup(players_df: pd.DataFrame):
         )
 
     roster_players = players_df.copy().reset_index(drop=True)
-    roster_players["_optimizer_player_id"] = roster_players.index
+    roster_players["_optimizer_player_id"] = roster_players.apply(
+        _get_optimizer_player_identity,
+        axis=1,
+    )
     hitter_slots = get_hitter_starting_slots()
 
+    # This is the same decision as the old brute-force search: assign each
+    # hitter slot to at most one eligible player and maximize projected points.
+    # The Hungarian assignment algorithm solves that directly instead of trying
+    # every possible permutation, which keeps add/drop simulations fast.
+    slot_count = len(hitter_slots)
+    player_count = len(roster_players)
+    size = max(slot_count, player_count)
+    invalid_assignment_penalty = 1_000_000
+    cost_matrix = [
+        [invalid_assignment_penalty for _ in range(size)]
+        for _ in range(size)
+    ]
+
+    for slot_index, roster_slot in enumerate(hitter_slots):
+        for player_index, player_row in roster_players.iterrows():
+            if validate_hitter_eligibility(player_row, roster_slot):
+                projected_points = pd.to_numeric(
+                    player_row.get("projected_fantasy_points", 0),
+                    errors="coerce",
+                )
+
+                if pd.isna(projected_points):
+                    projected_points = 0
+
+                cost_matrix[slot_index][player_index] = -float(projected_points)
+
+    row_indexes, column_indexes = linear_sum_assignment(cost_matrix)
     best_assignments = []
-    best_total_points = -1
 
-    def search(slot_index: int, used_player_ids: set, current_assignments: list):
-        """Try valid assignments one lineup slot at a time."""
+    for row_index, column_index in zip(row_indexes, column_indexes):
+        if row_index >= slot_count or column_index >= player_count:
+            continue
 
-        nonlocal best_assignments
-        nonlocal best_total_points
+        if cost_matrix[row_index][column_index] >= invalid_assignment_penalty:
+            continue
 
-        current_total_points = sum(
-            assignment["projected_fantasy_points"] for assignment in current_assignments
-        )
-
-        # Prefer the lineup with more filled slots. Use projected points as the
-        # tiebreaker when two partial lineups fill the same number of slots.
-        if (
-            len(current_assignments) > len(best_assignments)
-            or (
-                len(current_assignments) == len(best_assignments)
-                and current_total_points > best_total_points
-            )
-        ):
-            best_assignments = current_assignments.copy()
-            best_total_points = current_total_points
-
-        if slot_index >= len(hitter_slots):
-            return
-
-        roster_slot = hitter_slots[slot_index]
-
-        # Option 1: try every unused player who is eligible for this exact slot.
-        for _, player_row in roster_players.iterrows():
-            player_id = player_row["_optimizer_player_id"]
-
-            if player_id in used_player_ids:
-                continue
-
-            if not validate_hitter_eligibility(player_row, roster_slot):
-                continue
-
-            next_assignment = {
-                "roster_slot": roster_slot,
+        player_row = roster_players.iloc[column_index]
+        best_assignments.append(
+            {
+                "roster_slot": hitter_slots[row_index],
                 "player": player_row["player"],
                 "eligible_positions": player_row["eligible_positions"],
+                "roster_spot": player_row.get("roster_spot", ""),
                 "projected_fantasy_points": player_row["projected_fantasy_points"],
                 "projection_source": player_row.get("projection_source", ""),
                 "projection_confidence": player_row.get("projection_confidence", ""),
-                "_optimizer_player_id": player_id,
+                "injury_status": player_row.get("injury_status", ""),
+                "availability_note": player_row.get("availability_note", ""),
+                "_optimizer_player_id": player_row["_optimizer_player_id"],
             }
-
-            search(
-                slot_index + 1,
-                used_player_ids | {player_id},
-                current_assignments + [next_assignment],
-            )
-
-        # Option 2: skip this slot. This lets us return the best partial lineup
-        # when a complete valid lineup cannot be created.
-        search(slot_index + 1, used_player_ids, current_assignments)
-
-    search(0, set(), [])
+        )
 
     lineup_df = pd.DataFrame(best_assignments)
 
@@ -672,6 +735,19 @@ def optimize_hitter_lineup(players_df: pd.DataFrame):
         )
     else:
         warning_message = ""
+
+    if not lineup_df.empty:
+        duplicate_assignments = lineup_df["player"].duplicated().any()
+
+        if duplicate_assignments:
+            duplicate_warning = (
+                "Debug warning: duplicate player assignment detected in optimized lineup."
+            )
+            warning_message = (
+                f"{warning_message} {duplicate_warning}".strip()
+                if warning_message
+                else duplicate_warning
+            )
 
     return lineup_df, bench_df, warning_message
 
@@ -877,7 +953,9 @@ def _calculate_multi_add_risk_adjusted_score(
 def evaluate_multi_add_hitter_scenarios(
     roster_df: pd.DataFrame,
     available_df: pd.DataFrame,
+    active_roster_df: pd.DataFrame | None = None,
     max_adds: int | None = None,
+    progress_callback=None,
 ) -> pd.DataFrame:
     """Evaluate adding multiple hitters when open roster spots exist.
 
@@ -902,20 +980,27 @@ def evaluate_multi_add_hitter_scenarios(
     ]
 
     if roster_df is None or available_df is None or roster_df.empty or available_df.empty:
-        return pd.DataFrame(columns=output_columns)
+        empty_df = pd.DataFrame(columns=output_columns)
+        empty_df.attrs["simulation_count"] = 0
+        return empty_df
 
     available_hitters_df = available_df[
         available_df.apply(lambda row: infer_player_type(row) == "HITTER", axis=1)
     ].copy()
 
     if available_hitters_df.empty:
-        return pd.DataFrame(columns=output_columns)
+        empty_df = pd.DataFrame(columns=output_columns)
+        empty_df.attrs["simulation_count"] = 0
+        return empty_df
 
-    current_active_roster_count = count_active_roster_spots(roster_df)
+    roster_count_df = active_roster_df if active_roster_df is not None else roster_df
+    current_active_roster_count = count_active_roster_spots(roster_count_df)
     open_active_spots = LEAGUE_RULES["active_roster_spots"] - current_active_roster_count
 
     if open_active_spots <= 0:
-        return pd.DataFrame(columns=output_columns)
+        empty_df = pd.DataFrame(columns=output_columns)
+        empty_df.attrs["simulation_count"] = 0
+        return empty_df
 
     if max_adds is None:
         max_adds = min(open_active_spots, 3)
@@ -925,12 +1010,24 @@ def evaluate_multi_add_hitter_scenarios(
     current_lineup_df, _, _ = optimize_hitter_lineup(roster_df)
     current_starting_total = _get_starting_total(current_lineup_df)
     scenario_rows = []
+    simulation_count = 0
 
     # Try every available-player combination from one add up to max_adds.
     # This is simple and readable; if the available pool grows large later, we
     # can replace it with a smarter search.
     for number_of_adds in range(1, max_adds + 1):
         for player_indexes in combinations(available_hitters_df.index, number_of_adds):
+            simulation_count += 1
+
+            if progress_callback is not None and simulation_count % 50 == 0:
+                progress_callback(
+                    {
+                        "phase": "multi_add",
+                        "simulation_count": simulation_count,
+                        "number_of_adds": number_of_adds,
+                    }
+                )
+
             added_players = available_hitters_df.loc[list(player_indexes)].copy()
             roster_with_adds = pd.concat(
                 [roster_df, added_players],
@@ -967,15 +1064,20 @@ def evaluate_multi_add_hitter_scenarios(
                 }
             )
 
-    return pd.DataFrame(scenario_rows, columns=output_columns).sort_values(
+    result_df = pd.DataFrame(scenario_rows, columns=output_columns).sort_values(
         by="risk_adjusted_score",
         ascending=False,
     )
+    result_df.attrs["simulation_count"] = simulation_count
+    return result_df
 
 
 def evaluate_single_hitter_pickups(
     roster_df: pd.DataFrame,
     available_df: pd.DataFrame,
+    active_roster_df: pd.DataFrame | None = None,
+    treat_bench_hitters_as_droppable: bool = True,
+    progress_callback=None,
 ) -> pd.DataFrame:
     """Evaluate one hitter pickup move at a time.
 
@@ -1006,25 +1108,53 @@ def evaluate_single_hitter_pickups(
         "drop_long_term_value",
         "drop_keeper_status",
         "drop_risk",
+        "drop_reason",
+        "impact_roster_slot",
+        "impact_current_player",
+        "impact_current_projected_points",
+        "impact_new_player",
+        "impact_new_projected_points",
+        "impact_point_difference",
         "risk_adjusted_score",
         "risk_adjusted_label",
         "recommendation",
     ]
 
     if roster_df is None or available_df is None or roster_df.empty or available_df.empty:
-        return pd.DataFrame(columns=output_columns)
+        empty_df = pd.DataFrame(columns=output_columns)
+        empty_df.attrs["simulation_count"] = 0
+        return empty_df
 
     current_lineup_df, _, _ = optimize_hitter_lineup(roster_df)
     current_starting_total = _get_starting_total(current_lineup_df)
-    current_active_roster_count = count_active_roster_spots(roster_df)
+    roster_count_df = active_roster_df if active_roster_df is not None else roster_df
+    current_active_roster_count = count_active_roster_spots(roster_count_df)
+    has_open_roster_spot = current_active_roster_count < LEAGUE_RULES[
+        "active_roster_spots"
+    ]
 
     recommendations = []
+    simulation_count = 0
+    add_only_simulation_count = 0
+    add_drop_simulation_count = 0
 
-    if has_open_active_roster_spot(roster_df):
-        # Add-only moves are allowed when there are fewer than 17 active players.
+    if has_open_roster_spot:
+        # Add-only moves are allowed when there are fewer active players than
+        # the configured active roster limit.
         # Carrying fewer pitchers than the maximum can create this kind of
         # hitter bench flexibility.
         for _, available_player in available_df.iterrows():
+            simulation_count += 1
+            add_only_simulation_count += 1
+
+            if progress_callback is not None and simulation_count % 50 == 0:
+                progress_callback(
+                    {
+                        "phase": "add_only",
+                        "simulation_count": simulation_count,
+                    }
+                )
+
             roster_with_add = pd.concat(
                 [
                     roster_df,
@@ -1036,6 +1166,15 @@ def evaluate_single_hitter_pickups(
             new_lineup_df, _, _ = optimize_hitter_lineup(roster_with_add)
             new_starting_total = _get_starting_total(new_lineup_df)
             projected_gain = new_starting_total - current_starting_total
+            lineup_changes = compare_lineups(current_lineup_df, new_lineup_df)
+            primary_change = (
+                lineup_changes.sort_values(
+                    by="point_difference",
+                    ascending=False,
+                ).iloc[0]
+                if not lineup_changes.empty
+                else {}
+            )
 
             recommendations.append(
                 _build_pickup_recommendation_row(
@@ -1065,81 +1204,169 @@ def evaluate_single_hitter_pickups(
                         "drop_long_term_value": "",
                         "drop_keeper_status": "",
                         "drop_risk": "",
+                        "drop_reason": "",
+                        "impact_roster_slot": primary_change.get("roster_slot", ""),
+                        "impact_current_player": primary_change.get(
+                            "current_player",
+                            "",
+                        ),
+                        "impact_current_projected_points": primary_change.get(
+                            "current_projected_points",
+                            0,
+                        ),
+                        "impact_new_player": primary_change.get("new_player", ""),
+                        "impact_new_projected_points": primary_change.get(
+                            "new_projected_points",
+                            0,
+                        ),
+                        "impact_point_difference": primary_change.get(
+                            "point_difference",
+                            0,
+                        ),
                         "recommendation": _get_pickup_recommendation(projected_gain),
                     }
                 )
             )
-    else:
-        droppable_roster_df = roster_df[
-            roster_df.apply(is_droppable_player, axis=1)
-        ].copy()
+    # Add/drop moves are still useful when safe droppable players exist. Even
+    # when add-only moves are available, this keeps the page from hiding better
+    # options or going blank when the active roster is full.
+    droppable_roster_df = roster_df[
+        roster_df.apply(
+            lambda row: is_droppable_player(
+                row,
+                treat_bench_hitters_as_droppable=treat_bench_hitters_as_droppable,
+            ),
+            axis=1,
+        )
+    ].copy()
 
-        for _, available_player in available_df.iterrows():
-            for _, drop_player in droppable_roster_df.iterrows():
-                roster_without_drop = roster_df[
-                    roster_df["player"] != drop_player["player"]
-                ].copy()
-                roster_with_add = pd.concat(
-                    [
-                        roster_without_drop,
-                        pd.DataFrame([available_player.to_dict()]),
-                    ],
-                    ignore_index=True,
+    for _, available_player in available_df.iterrows():
+        for _, drop_player in droppable_roster_df.iterrows():
+            simulation_count += 1
+            add_drop_simulation_count += 1
+
+            if progress_callback is not None and simulation_count % 50 == 0:
+                progress_callback(
+                    {
+                        "phase": "add_drop",
+                        "simulation_count": simulation_count,
+                        "add_player": available_player.get("player", ""),
+                        "drop_player": drop_player.get("player", ""),
+                    }
                 )
 
-                new_lineup_df, _, _ = optimize_hitter_lineup(roster_with_add)
-                new_starting_total = _get_starting_total(new_lineup_df)
-                projected_gain = new_starting_total - current_starting_total
+            drop_status, drop_reason = get_drop_protection_status(
+                drop_player,
+                treat_bench_hitters_as_droppable=treat_bench_hitters_as_droppable,
+            )
+            roster_without_drop = roster_df[
+                roster_df["player"] != drop_player["player"]
+            ].copy()
+            roster_with_add = pd.concat(
+                [
+                    roster_without_drop,
+                    pd.DataFrame([available_player.to_dict()]),
+                ],
+                ignore_index=True,
+            )
 
-                recommendations.append(
-                    _build_pickup_recommendation_row(
-                        {
-                            "move_type": "Add/Drop",
-                            "add_player": available_player.get("player", ""),
-                            "add_eligible_positions": available_player.get(
-                                "eligible_positions",
-                                "",
-                            ),
-                            "drop_player": drop_player.get("player", ""),
-                            "drop_eligible_positions": drop_player.get(
-                                "eligible_positions",
-                                "",
-                            ),
-                            "current_active_roster_count": current_active_roster_count,
-                            "current_starting_total": current_starting_total,
-                            "new_starting_total": new_starting_total,
-                            "projected_gain": projected_gain,
-                            "add_projection_source": available_player.get(
-                                "projection_source",
-                                "",
-                            ),
-                            "add_projection_confidence": available_player.get(
-                                "projection_confidence",
-                                "",
-                            ),
-                            "drop_projection_source": drop_player.get(
-                                "projection_source",
-                                "",
-                            ),
-                            "drop_projection_confidence": drop_player.get(
-                                "projection_confidence",
-                                "",
-                            ),
-                            "drop_long_term_value": drop_player.get(
-                                "long_term_value",
-                                "",
-                            ),
-                            "drop_keeper_status": drop_player.get(
-                                "keeper_status",
-                                "",
-                            ),
-                            "drop_risk": get_drop_risk(drop_player),
-                            "recommendation": _get_pickup_recommendation(projected_gain),
-                        }
-                    )
+            new_lineup_df, _, _ = optimize_hitter_lineup(roster_with_add)
+            new_starting_total = _get_starting_total(new_lineup_df)
+            projected_gain = new_starting_total - current_starting_total
+            lineup_changes = compare_lineups(current_lineup_df, new_lineup_df)
+            primary_change = (
+                lineup_changes.sort_values(
+                    by="point_difference",
+                    ascending=False,
+                ).iloc[0]
+                if not lineup_changes.empty
+                else {}
+            )
+
+            recommendations.append(
+                _build_pickup_recommendation_row(
+                    {
+                        "move_type": "Add/Drop",
+                        "add_player": available_player.get("player", ""),
+                        "add_eligible_positions": available_player.get(
+                            "eligible_positions",
+                            "",
+                        ),
+                        "drop_player": drop_player.get("player", ""),
+                        "drop_eligible_positions": drop_player.get(
+                            "eligible_positions",
+                            "",
+                        ),
+                        "current_active_roster_count": current_active_roster_count,
+                        "current_starting_total": current_starting_total,
+                        "new_starting_total": new_starting_total,
+                        "projected_gain": projected_gain,
+                        "add_projection_source": available_player.get(
+                            "projection_source",
+                            "",
+                        ),
+                        "add_projection_confidence": available_player.get(
+                            "projection_confidence",
+                            "",
+                        ),
+                        "drop_projection_source": drop_player.get(
+                            "projection_source",
+                            "",
+                        ),
+                        "drop_projection_confidence": drop_player.get(
+                            "projection_confidence",
+                            "",
+                        ),
+                        "drop_long_term_value": drop_player.get(
+                            "long_term_value",
+                            "",
+                        ),
+                        "drop_keeper_status": drop_player.get(
+                            "keeper_status",
+                            "",
+                        ),
+                        "drop_risk": get_drop_risk(drop_player),
+                        "drop_reason": drop_reason,
+                        "impact_roster_slot": primary_change.get("roster_slot", ""),
+                        "impact_current_player": primary_change.get(
+                            "current_player",
+                            "",
+                        ),
+                        "impact_current_projected_points": primary_change.get(
+                            "current_projected_points",
+                            0,
+                        ),
+                        "impact_new_player": primary_change.get("new_player", ""),
+                        "impact_new_projected_points": primary_change.get(
+                            "new_projected_points",
+                            0,
+                        ),
+                        "impact_point_difference": primary_change.get(
+                            "point_difference",
+                            0,
+                        ),
+                        "recommendation": _get_pickup_recommendation(projected_gain),
+                    }
                 )
+            )
 
-    return pd.DataFrame(recommendations, columns=output_columns).sort_values(
-        by="risk_adjusted_score",
-        ascending=False,
+    recommendations_df = pd.DataFrame(recommendations, columns=output_columns)
+    recommendations_df.attrs["simulation_count"] = simulation_count
+    recommendations_df.attrs["add_only_simulation_count"] = add_only_simulation_count
+    recommendations_df.attrs["add_drop_simulation_count"] = add_drop_simulation_count
+
+    if recommendations_df.empty:
+        return recommendations_df
+
+    sort_column = (
+        "risk_adjusted_score"
+        if "risk_adjusted_score" in recommendations_df.columns
+        and not recommendations_df["risk_adjusted_score"].isna().all()
+        else "projected_gain"
     )
+
+    sorted_df = recommendations_df.sort_values(by=sort_column, ascending=False)
+    sorted_df.attrs["simulation_count"] = simulation_count
+    sorted_df.attrs["add_only_simulation_count"] = add_only_simulation_count
+    sorted_df.attrs["add_drop_simulation_count"] = add_drop_simulation_count
+    return sorted_df

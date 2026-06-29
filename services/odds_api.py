@@ -25,6 +25,7 @@ from config import (
     ODDS_API_ODDS_FORMAT,
     ODDS_API_REGION,
 )
+from utils.mlb_teams import build_teams_playing_today
 
 
 class MissingOddsAPIKeyError(Exception):
@@ -78,6 +79,7 @@ __all__ = [
     "load_cached_hitter_props",
     "save_hitter_props_cache",
     "cleanup_old_odds_cache",
+    "get_mlb_teams_playing_today_from_cache",
 ]
 
 
@@ -676,6 +678,29 @@ def fetch_todays_mlb_events(force_refresh: bool = False) -> list[dict]:
     # The events endpoint returns upcoming games. We filter to today locally so
     # the app displays only today's MLB schedule.
     return [event for event in events if is_event_today(event)]
+
+
+def get_mlb_teams_playing_today_from_cache() -> set[str]:
+    """Return MLB team codes playing today from cached Odds API events only.
+
+    This helper is intentionally cache-only so Streamlit page refreshes do not
+    burn Odds API credits just to decide whether a player has a game today.
+    """
+
+    endpoint_type = "events"
+    cache_path = _build_cache_path(endpoint_type)
+    cached_events, _cached_source = _read_cache_file(cache_path)
+
+    if cached_events is None:
+        return set()
+
+    todays_events = [
+        event
+        for event in cached_events
+        if isinstance(event, dict) and is_event_today(event)
+    ]
+
+    return build_teams_playing_today(todays_events)
 
 
 def fetch_event_hitter_props(event_id: str, force_refresh: bool = False) -> dict:
