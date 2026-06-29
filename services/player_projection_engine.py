@@ -55,6 +55,14 @@ PLAYER_PROJECTION_COLUMNS = [
     "missing_markets",
     "fallback_markets_used",
     "fallback_projection_note",
+    "secondary_fallback_stats_used",
+    "secondary_fallback_note",
+    "matched_stats_player",
+    "stats_player_name_before_cleaning",
+    "stats_player_name_after_cleaning",
+    "normalized_stats_name",
+    "stats_match_method",
+    "stats_match_score",
     "projected_hits",
     "projected_home_runs",
     "projected_rbi",
@@ -98,6 +106,18 @@ PLAYER_PROJECTION_COLUMNS = [
     "over_only_discount_applied",
     "probability_methods",
     "projection_adjustment_note",
+    "games_played",
+    "at_bats",
+    "plate_appearances",
+    "hits",
+    "walks",
+    "strikeouts",
+    "hit_by_pitch",
+    "intentional_walks",
+    "sacrifices",
+    "stolen_bases",
+    "caught_stealing",
+    "ground_into_double_play",
     "batting_average",
     "obp",
     "slg",
@@ -105,6 +125,7 @@ PLAYER_PROJECTION_COLUMNS = [
 ]
 STAT_CONTEXT_COLUMNS = [
     "games_played",
+    "at_bats",
     "plate_appearances",
     "batting_average",
     "obp",
@@ -126,6 +147,126 @@ STAT_CONTEXT_COLUMNS = [
     "caught_stealing",
     "ground_into_double_play",
 ]
+TEXT_PROJECTION_COLUMNS = [
+    "player",
+    "normalized_player_name",
+    "player_match_key",
+    "team",
+    "eligible_positions",
+    "bookmaker",
+    "markets_available",
+    "missing_markets",
+    "fallback_markets_used",
+    "fallback_projection_note",
+    "secondary_fallback_stats_used",
+    "secondary_fallback_note",
+    "matched_stats_player",
+    "stats_player_name_before_cleaning",
+    "stats_player_name_after_cleaning",
+    "normalized_stats_name",
+    "stats_match_method",
+    "projection_source",
+    "projection_confidence",
+    "availability_note",
+    "game_today_note",
+    "injury_status",
+    "status",
+    "pro_team",
+    "player_notes",
+    "lineup_status",
+    "fantasy_status",
+    "espn_player_id",
+    "probability_methods",
+    "projection_adjustment_note",
+]
+NUMERIC_PROJECTION_COLUMNS = [
+    "bookmaker_count",
+    "stats_match_score",
+    "projected_hits",
+    "projected_home_runs",
+    "projected_rbi",
+    "projected_runs",
+    "projected_stolen_bases",
+    "projected_total_bases",
+    "projected_singles",
+    "projected_doubles",
+    "projected_triples",
+    "estimated_singles",
+    "estimated_doubles",
+    "estimated_triples",
+    "projected_extra_base_hits",
+    "estimated_extra_base_hits",
+    "projected_walks",
+    "projected_strikeouts",
+    "projected_hit_by_pitch",
+    "projected_intentional_walks",
+    "projected_sacrifices",
+    "projected_caught_stealing",
+    "projected_ground_into_double_play",
+    "projected_game_winning_rbi",
+    "projected_grand_slams",
+    "projected_hit_for_cycle",
+    "projected_fantasy_points",
+    "games_played",
+    "at_bats",
+    "plate_appearances",
+    "hits",
+    "walks",
+    "strikeouts",
+    "hit_by_pitch",
+    "intentional_walks",
+    "sacrifices",
+    "stolen_bases",
+    "caught_stealing",
+    "ground_into_double_play",
+    "batting_average",
+    "obp",
+    "slg",
+    "ops",
+]
+
+
+def ensure_projection_column_types(projection_table: pd.DataFrame) -> pd.DataFrame:
+    """Keep projection tracking text and numeric columns in stable dtypes."""
+
+    projection_table = projection_table.copy()
+
+    for column in TEXT_PROJECTION_COLUMNS:
+        if column not in projection_table.columns:
+            projection_table[column] = ""
+        projection_table[column] = projection_table[column].astype("object")
+        projection_table[column] = projection_table[column].where(
+            projection_table[column].notna(),
+            "",
+        )
+
+    for column in NUMERIC_PROJECTION_COLUMNS:
+        if column not in projection_table.columns:
+            projection_table[column] = 0.0
+        projection_table[column] = pd.to_numeric(
+            projection_table[column],
+            errors="coerce",
+        )
+
+    zero_fill_columns = [
+        column
+        for column in NUMERIC_PROJECTION_COLUMNS
+        if column
+        not in {
+            "batting_average",
+            "obp",
+            "slg",
+            "ops",
+            "games_played",
+            "at_bats",
+            "plate_appearances",
+        }
+    ]
+    projection_table[zero_fill_columns] = projection_table[zero_fill_columns].fillna(
+        0.0
+    )
+
+    return projection_table
 MARKET_TO_PROJECTION_COLUMN = {
     "batter_hits": "projected_hits",
     "batter_home_runs": "projected_home_runs",
@@ -198,6 +339,91 @@ def _has_usable_stat_context(player_row) -> bool:
     return any(_to_number(player_row.get(column, pd.NA)) > 0 for column in stat_columns)
 
 
+def _get_playing_time_denominator(player_row) -> float:
+    """Estimate games played for neutral season-rate projections."""
+
+    games_played = _to_number(player_row.get("games_played", pd.NA))
+    at_bats = _to_number(player_row.get("at_bats", pd.NA))
+    plate_appearances = _to_number(player_row.get("plate_appearances", pd.NA))
+
+    if games_played > 0:
+        return games_played
+
+    if plate_appearances > 0:
+        return max(plate_appearances / 4.2, 1)
+
+    if at_bats > 0:
+        return max(at_bats / 3.8, 1)
+
+    return 0.0
+
+
+def _has_usable_secondary_stat_context(player_row) -> bool:
+    """Return True when season stats can fill non-prop scoring categories."""
+
+    if _get_playing_time_denominator(player_row) <= 0:
+        return False
+
+    secondary_columns = [
+        "walks",
+        "strikeouts",
+        "hit_by_pitch",
+        "intentional_walks",
+        "sacrifices",
+        "caught_stealing",
+        "ground_into_double_play",
+        "stolen_bases",
+    ]
+    return any(_to_number(player_row.get(column, pd.NA)) > 0 for column in secondary_columns)
+
+
+def _estimate_secondary_scoring_fallbacks(player_row) -> dict:
+    """Estimate secondary scoring categories from neutral season rates.
+
+    These categories generally do not have hitter prop markets in our current
+    feed, so sportsbook-projected players still need season-rate estimates for
+    walks, strikeouts, HBP, IBB, sacrifices, caught stealing, and GIDP.
+    """
+
+    playing_time_denominator = _get_playing_time_denominator(player_row)
+
+    if playing_time_denominator <= 0:
+        return {
+            "projected_walks": 0.0,
+            "projected_strikeouts": 0.0,
+            "projected_hit_by_pitch": 0.0,
+            "projected_intentional_walks": 0.0,
+            "projected_sacrifices": 0.0,
+            "projected_caught_stealing": 0.0,
+            "projected_ground_into_double_play": 0.0,
+        }
+
+    def per_game(stat_column: str) -> float:
+        return _to_number(player_row.get(stat_column, pd.NA)) / playing_time_denominator
+
+    stolen_bases = _to_number(player_row.get("stolen_bases", pd.NA))
+    caught_stealing = _to_number(player_row.get("caught_stealing", pd.NA))
+    projected_stolen_bases = _to_number(player_row.get("projected_stolen_bases", 0.0))
+    if projected_stolen_bases <= 0:
+        projected_stolen_bases = per_game("stolen_bases")
+    projected_caught_stealing = 0.0
+
+    if stolen_bases + caught_stealing > 0:
+        projected_caught_stealing = projected_stolen_bases * (
+            caught_stealing / (stolen_bases + caught_stealing)
+        )
+
+    return {
+        "projected_walks": per_game("walks"),
+        "projected_strikeouts": per_game("strikeouts"),
+        "projected_hit_by_pitch": per_game("hit_by_pitch"),
+        "projected_intentional_walks": per_game("intentional_walks"),
+        "projected_sacrifices": per_game("sacrifices"),
+        "projected_caught_stealing": projected_caught_stealing,
+        "projected_ground_into_double_play": per_game("ground_into_double_play"),
+    }
+
+
 def _estimate_stat_based_fantasy_points(player_row) -> dict:
     """Estimate a neutral daily projection from season-to-date stats.
 
@@ -206,16 +432,10 @@ def _estimate_stat_based_fantasy_points(player_row) -> dict:
     because season stats are not sportsbook prices.
     """
 
-    games_played = _to_number(player_row.get("games_played", pd.NA))
-    plate_appearances = _to_number(player_row.get("plate_appearances", pd.NA))
+    playing_time_denominator = _get_playing_time_denominator(player_row)
     matchup_adjustment_factor = 1.00
 
-    if games_played > 0:
-        playing_time_denominator = games_played
-    elif plate_appearances > 0:
-        # Roughly estimate games from PA when games played is unavailable.
-        playing_time_denominator = max(plate_appearances / 4.2, 1)
-    else:
+    if playing_time_denominator <= 0:
         # Last-resort denominator keeps season totals from becoming a one-day
         # projection when the source does not include games or PA.
         playing_time_denominator = 162
@@ -267,6 +487,7 @@ def _estimate_stat_based_fantasy_points(player_row) -> dict:
         "projected_caught_stealing": projected_caught_stealing,
         "projected_ground_into_double_play": per_game(ground_into_double_play),
     }
+    fallback_values.update(_estimate_secondary_scoring_fallbacks(player_row))
     fallback_values.update(
         estimate_hit_type_breakdown(
             fallback_values["projected_hits"],
@@ -438,15 +659,7 @@ def _apply_missing_market_fallbacks(
     if projection_table.empty:
         return projection_table
 
-    projection_table = projection_table.copy()
-
-    for column in [
-        "missing_markets",
-        "fallback_markets_used",
-        "fallback_projection_note",
-    ]:
-        if column not in projection_table.columns:
-            projection_table[column] = ""
+    projection_table = ensure_projection_column_types(projection_table)
 
     for index, player_row in projection_table.iterrows():
         available_markets = _parse_available_markets(
@@ -459,6 +672,10 @@ def _apply_missing_market_fallbacks(
         ]
         fallback_markets_used = []
         fallback_note = ""
+        additional_fallback_values = {}
+        secondary_fallback_values = {}
+        secondary_fallback_stats_used = []
+        secondary_fallback_note = ""
 
         # Prop rows can also have a market present but an empty value after
         # cleaning. Treat that as missing for fallback purposes.
@@ -468,12 +685,14 @@ def _apply_missing_market_fallbacks(
                     missing_markets.append(market)
 
         can_use_fallback = _has_usable_stat_context(player_row)
+        can_use_secondary_fallback = _has_usable_secondary_stat_context(player_row)
 
         if (
             not include_unavailable_players
             and not _to_bool(player_row.get("is_available_today", True), True)
         ):
             can_use_fallback = False
+            can_use_secondary_fallback = False
             if missing_markets:
                 if not _to_bool(player_row.get("has_game_today", True), True):
                     fallback_note = (
@@ -486,9 +705,6 @@ def _apply_missing_market_fallbacks(
 
         if can_use_fallback:
             fallback_values = _estimate_stat_based_projection_values(player_row)
-            additional_fallback_values = _estimate_additional_scoring_fallbacks(
-                player_row
-            )
 
             for market in missing_markets:
                 projection_column = MARKET_TO_PROJECTION_COLUMN[market]
@@ -498,23 +714,58 @@ def _apply_missing_market_fallbacks(
                     projection_table.at[index, projection_column] = fallback_value
                     fallback_markets_used.append(market)
 
-            for projection_column, fallback_value in additional_fallback_values.items():
-                if pd.isna(player_row.get(projection_column, pd.NA)):
-                    projection_table.at[index, projection_column] = fallback_value
-
             if fallback_markets_used:
                 fallback_note = (
                     "Missing sportsbook markets filled from neutral season "
                     "per-game stats. No arbitrary 0.85 discount was applied."
                 )
 
+        if can_use_secondary_fallback:
+            updated_player_row = projection_table.loc[index].copy()
+            secondary_fallback_values = _estimate_secondary_scoring_fallbacks(
+                updated_player_row
+            )
+            secondary_stat_columns = {
+                "projected_walks": "BB",
+                "projected_strikeouts": "K",
+                "projected_hit_by_pitch": "HBP",
+                "projected_intentional_walks": "IBB",
+                "projected_sacrifices": "SAC",
+                "projected_caught_stealing": "CS",
+                "projected_ground_into_double_play": "GIDP",
+            }
+
+            for projection_column, source_label in secondary_stat_columns.items():
+                fallback_value = secondary_fallback_values.get(projection_column, 0.0)
+                projection_table.at[index, projection_column] = fallback_value
+                if fallback_value > 0:
+                    secondary_fallback_stats_used.append(source_label)
+
+            if secondary_fallback_stats_used:
+                secondary_fallback_note = (
+                    "Secondary scoring categories filled from neutral season "
+                    "per-game rates even though primary projection may use sportsbook props."
+                )
+        elif not str(player_row.get("matched_stats_player", "")).strip():
+            secondary_fallback_note = "No season stats matched."
+        elif _get_playing_time_denominator(player_row) <= 0:
+            secondary_fallback_note = (
+                "Season stats matched, but games played, plate appearances, "
+                "and at-bats were unavailable."
+            )
+
         projection_table.at[index, "missing_markets"] = ", ".join(missing_markets)
         projection_table.at[index, "fallback_markets_used"] = ", ".join(
             fallback_markets_used
         )
         projection_table.at[index, "fallback_projection_note"] = fallback_note
+        projection_table.at[index, "secondary_fallback_stats_used"] = ", ".join(
+            secondary_fallback_stats_used
+        )
+        projection_table.at[index, "secondary_fallback_note"] = secondary_fallback_note
 
     projection_table = _recalculate_hit_breakdown_and_points(projection_table)
+    projection_table = ensure_projection_column_types(projection_table)
 
     return projection_table
 
@@ -968,6 +1219,10 @@ def build_player_projection_table(
     except (PlayerStatsError, Exception) as error:
         stats_error = str(error)
         projection_table = _add_blank_context_columns(projection_table)
+        projection_table["matched_stats_player"] = ""
+        projection_table["normalized_stats_name"] = ""
+        projection_table["stats_match_method"] = "stats load failed"
+        projection_table["stats_match_score"] = 0
 
     projection_table = _apply_missing_market_fallbacks(
         projection_table,
@@ -1031,6 +1286,7 @@ def build_player_projection_table(
         if column not in projection_table.columns:
             projection_table[column] = pd.NA
 
+    projection_table = ensure_projection_column_types(projection_table)
     projection_table = projection_table[PLAYER_PROJECTION_COLUMNS].sort_values(
         by="projected_fantasy_points",
         ascending=False,
@@ -1039,6 +1295,37 @@ def build_player_projection_table(
     output_table = projection_table.reset_index(drop=True)
     output_table.attrs["player_stats_loaded"] = stats_loaded
     output_table.attrs["player_stats_error"] = stats_error
+    stats_matched = (
+        output_table["matched_stats_player"].fillna("").astype(str).str.strip() != ""
+        if "matched_stats_player" in output_table.columns
+        else pd.Series([False] * len(output_table))
+    )
+    sportsbook_projected = (
+        output_table["projection_source"].fillna("").astype(str).str.contains(
+            "Sportsbook",
+            case=False,
+        )
+        if "projection_source" in output_table.columns
+        else pd.Series([False] * len(output_table))
+    )
+    stat_fallback_only = (
+        output_table["projection_source"].fillna("").astype(str).eq(
+            "Stat-based fallback"
+        )
+        if "projection_source" in output_table.columns
+        else pd.Series([False] * len(output_table))
+    )
+    output_table.attrs["season_stats_match_counts"] = {
+        "total_projection_rows": int(len(output_table)),
+        "projection_rows_with_season_stats_matched": int(stats_matched.sum()),
+        "projection_rows_missing_season_stats": int((~stats_matched).sum()),
+        "sportsbook_projected_rows_missing_season_stats": int(
+            (sportsbook_projected & ~stats_matched).sum()
+        ),
+        "stat_fallback_only_rows_missing_season_stats": int(
+            (stat_fallback_only & ~stats_matched).sum()
+        ),
+    }
     output_table.attrs["odds_data_source"] = get_odds_data_source_status()
     output_table.attrs["market_diagnostics_row_count"] = len(
         build_hitter_prop_market_diagnostics(prop_rows)

@@ -52,6 +52,7 @@ try:
 
     display_columns = [
         "player",
+        "normalized_player_name",
         "batting_average",
         "obp",
         "slg",
@@ -63,6 +64,9 @@ try:
         "strikeout_rate",
     ]
 
+    display_columns = [
+        column for column in display_columns if column in stats_dataframe.columns
+    ]
     display_dataframe = stats_dataframe[display_columns].copy()
 
     # Format rate stats so the table is easier to scan.

@@ -11,11 +11,45 @@ import re
 import unicodedata
 
 
+def clean_player_name_encoding(name) -> str:
+    """Fix escaped UTF-8 or mojibake player names without changing normal names.
+
+    Some stat sources can return text like ``Heriberto Hern\\xc3\\xa1ndez`` or
+    ``Heriberto HernÃ¡ndez``. The first is escaped UTF-8 and the second is
+    mojibake. Both should display as ``Heriberto Hernández``.
+    """
+
+    if not isinstance(name, str):
+        return ""
+
+    cleaned_name = name.strip()
+
+    if not cleaned_name:
+        return ""
+
+    if "\\x" in cleaned_name:
+        try:
+            unescaped_name = cleaned_name.encode("utf-8").decode("unicode_escape")
+            cleaned_name = unescaped_name.encode("latin1").decode("utf-8")
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            pass
+
+    if any(marker in cleaned_name for marker in ["Ã", "Â"]):
+        try:
+            cleaned_name = cleaned_name.encode("latin1").decode("utf-8")
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            pass
+
+    return cleaned_name
+
+
 def normalize_player_name(name) -> str:
     """Return a lowercase, punctuation-free version of a player name."""
 
     if not isinstance(name, str):
         return ""
+
+    name = clean_player_name_encoding(name)
 
     # Convert accented characters into plain ASCII equivalents.
     normalized = unicodedata.normalize("NFKD", name)

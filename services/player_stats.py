@@ -6,12 +6,17 @@ directly.
 """
 
 import os
-import re
-import unicodedata
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
+
+from utils.name_matching import (
+    build_player_match_key,
+    clean_player_name_encoding,
+    fuzzy_match_player_name,
+    normalize_player_name as normalize_match_name,
+)
 
 
 # pybaseball and matplotlib both create cache/config files during import. We
@@ -24,7 +29,10 @@ os.environ.setdefault("MPLCONFIGDIR", str(PROJECT_ROOT / ".matplotlib_cache"))
 
 PLAYER_STATS_COLUMNS = [
     "player",
+    "stats_player_name_before_cleaning",
+    "stats_player_name_after_cleaning",
     "games_played",
+    "at_bats",
     "plate_appearances",
     "batting_average",
     "obp",
@@ -60,20 +68,7 @@ def normalize_player_name(player_name: str) -> str:
     of a name.
     """
 
-    if not isinstance(player_name, str):
-        return ""
-
-    # Convert accented characters into plain ASCII equivalents.
-    normalized = unicodedata.normalize("NFKD", player_name)
-    normalized = normalized.encode("ascii", "ignore").decode("ascii")
-
-    # Lowercase, remove punctuation, and collapse extra spaces.
-    normalized = normalized.lower()
-    normalized = re.sub(r"[^a-z0-9\s]", " ", normalized)
-    normalized = re.sub(r"\b(jr|sr|ii|iii|iv)\b", "", normalized)
-    normalized = re.sub(r"\s+", " ", normalized).strip()
-
-    return normalized
+    return normalize_match_name(player_name)
 
 
 def _first_available_column(dataframe: pd.DataFrame, candidates: list[str]) -> str | None:
@@ -174,7 +169,13 @@ def normalize_hitting_stats(raw_stats: pd.DataFrame) -> pd.DataFrame:
     stats_dataframe = pd.DataFrame()
 
     _copy_column(raw_stats, stats_dataframe, "player", ["Name", "name", "Player"])
+    stats_dataframe["stats_player_name_before_cleaning"] = stats_dataframe["player"]
+    stats_dataframe["player"] = stats_dataframe["player"].apply(
+        clean_player_name_encoding
+    )
+    stats_dataframe["stats_player_name_after_cleaning"] = stats_dataframe["player"]
     _copy_column(raw_stats, stats_dataframe, "games_played", ["G", "Games"])
+    _copy_column(raw_stats, stats_dataframe, "at_bats", ["AB", "At Bats"])
     _copy_column(raw_stats, stats_dataframe, "plate_appearances", ["PA"])
     _copy_column(raw_stats, stats_dataframe, "batting_average", ["AVG", "BA"])
     _copy_column(raw_stats, stats_dataframe, "obp", ["OBP"])
@@ -263,12 +264,85 @@ def add_player_stats_to_dataframe(
     output_dataframe["normalized_player_name"] = output_dataframe[player_column].apply(
         normalize_player_name
     )
-
-    matched_dataframe = output_dataframe.merge(
-        stats_dataframe,
-        on="normalized_player_name",
-        how="left",
-        suffixes=("", "_stats"),
+    output_dataframe["player_match_key"] = output_dataframe[player_column].apply(
+        build_player_match_key
     )
 
-    return matched_dataframe
+    normalized_stats = stats_dataframe.copy()
+    if "normalized_player_name" not in normalized_stats.columns:
+        normalized_stats["normalized_player_name"] = normalized_stats["player"].apply(
+            normalize_player_name
+        )
+    normalized_stats["player_match_key"] = normalized_stats["player"].apply(
+        build_player_match_key
+    )
+
+    stats_by_match_key = (
+        normalized_stats.drop_duplicates(subset=["player_match_key"], keep="first")
+        .set_index("player_match_key")
+    )
+    stats_by_normalized_name = (
+        normalized_stats.drop_duplicates(subset=["normalized_player_name"], keep="first")
+        .set_index("normalized_player_name")
+    )
+    stats_names = normalized_stats["player"].dropna().astype(str).unique().tolist()
+    stats_columns = [column for column in PLAYER_STATS_COLUMNS if column != "player"]
+    enriched_rows = []
+
+    for _, player_row in output_dataframe.iterrows():
+        enriched_row = player_row.to_dict()
+        player_match_key = enriched_row.get("player_match_key", "")
+        normalized_name = enriched_row.get("normalized_player_name", "")
+        matched_stats_row = None
+        match_method = ""
+        match_score = 0
+
+        if player_match_key and player_match_key in stats_by_match_key.index:
+            matched_stats_row = stats_by_match_key.loc[player_match_key]
+            match_method = "exact match key"
+            match_score = 100
+        elif normalized_name and normalized_name in stats_by_normalized_name.index:
+            matched_stats_row = stats_by_normalized_name.loc[normalized_name]
+            match_method = "exact normalized name"
+            match_score = 100
+        else:
+            fuzzy_name, fuzzy_score = fuzzy_match_player_name(
+                enriched_row.get(player_column, ""),
+                stats_names,
+                min_score=90,
+            )
+            if fuzzy_name:
+                matched_stats_row = normalized_stats[
+                    normalized_stats["player"] == fuzzy_name
+                ].iloc[0]
+                match_method = "fuzzy"
+                match_score = fuzzy_score
+
+        if matched_stats_row is not None:
+            enriched_row["matched_stats_player"] = matched_stats_row.get("player", "")
+            enriched_row["normalized_stats_name"] = matched_stats_row.get(
+                "normalized_player_name",
+                "",
+            )
+            enriched_row["stats_match_method"] = match_method
+            enriched_row["stats_match_score"] = match_score
+            for column in stats_columns:
+                enriched_row[column] = matched_stats_row.get(column, pd.NA)
+        else:
+            enriched_row["matched_stats_player"] = ""
+            enriched_row["normalized_stats_name"] = ""
+            enriched_row["stats_match_method"] = "unmatched"
+            enriched_row["stats_match_score"] = 0
+            for column in stats_columns:
+                if column not in enriched_row:
+                    enriched_row[column] = pd.NA
+
+        enriched_rows.append(enriched_row)
+
+    enriched_dataframe = pd.DataFrame(enriched_rows)
+    enriched_dataframe["stats_match_score"] = pd.to_numeric(
+        enriched_dataframe["stats_match_score"],
+        errors="coerce",
+    ).fillna(0)
+
+    return enriched_dataframe

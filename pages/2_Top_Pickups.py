@@ -2077,11 +2077,20 @@ try:
             sort=False,
         )
     )
+    master_pickup_table["sportsbook_match_score"] = pd.to_numeric(
+        master_pickup_table["sportsbook_match_score"],
+        errors="coerce",
+    ).fillna(0)
     sportsbook_match_diagnostics = pd.concat(
         [roster_match_diagnostics, available_match_diagnostics],
         ignore_index=True,
         sort=False,
     )
+    if not sportsbook_match_diagnostics.empty:
+        sportsbook_match_diagnostics["match_score"] = pd.to_numeric(
+            sportsbook_match_diagnostics["match_score"],
+            errors="coerce",
+        ).fillna(0)
 
     matched_sportsbook_players = set()
     if not sportsbook_match_diagnostics.empty:
@@ -2959,7 +2968,7 @@ try:
                     "found_in_espn_free_agents": not espn_rows.empty,
                     "found_in_projection_table": not projection_rows.empty,
                     "match_method": final_row.get("sportsbook_match_method", ""),
-                    "match_score": final_row.get("sportsbook_match_score", ""),
+                    "match_score": final_row.get("sportsbook_match_score", 0),
                     "matched_projection_player": final_row.get(
                         "matched_sportsbook_player",
                         "",

@@ -309,6 +309,8 @@ try:
                 "fallback_markets_used",
                 "projection_source",
                 "projection_confidence",
+                "secondary_fallback_stats_used",
+                "secondary_fallback_note",
                 "bookmaker_count",
                 "markets_available",
             ]
@@ -319,6 +321,121 @@ try:
             clean_dataframe_for_streamlit(projection_table[display_columns].round(3)),
             width="stretch",
         )
+
+        with st.expander("Secondary Stat Fallback Diagnostic"):
+            st.write(
+                "Sportsbook props drive the primary daily projection when "
+                "available. Walks, strikeouts, HBP, IBB, sacrifices, caught "
+                "stealing, and GIDP are filled from neutral season rates when "
+                "season stats exist because those categories usually do not "
+                "have hitter prop markets."
+            )
+            season_match_counts = projection_table.attrs.get(
+                "season_stats_match_counts",
+                {},
+            )
+            if not projection_table.attrs.get("player_stats_loaded", False):
+                st.warning(
+                    "Season stats did not load, so secondary stat fallback can "
+                    "only use zeros until pybaseball stats are available."
+                )
+                if projection_table.attrs.get("player_stats_error"):
+                    st.caption(
+                        f"Stats load error: {projection_table.attrs.get('player_stats_error')}"
+                    )
+            if season_match_counts:
+                metric_columns = st.columns(5)
+                metric_columns[0].metric(
+                    "Projection Rows",
+                    season_match_counts.get("total_projection_rows", 0),
+                )
+                metric_columns[1].metric(
+                    "Season Stats Matched",
+                    season_match_counts.get(
+                        "projection_rows_with_season_stats_matched",
+                        0,
+                    ),
+                )
+                metric_columns[2].metric(
+                    "Missing Season Stats",
+                    season_match_counts.get("projection_rows_missing_season_stats", 0),
+                )
+                metric_columns[3].metric(
+                    "Sportsbook Missing Stats",
+                    season_match_counts.get(
+                        "sportsbook_projected_rows_missing_season_stats",
+                        0,
+                    ),
+                )
+                metric_columns[4].metric(
+                    "Fallback Missing Stats",
+                    season_match_counts.get(
+                        "stat_fallback_only_rows_missing_season_stats",
+                        0,
+                    ),
+                )
+            secondary_columns = [
+                column
+                for column in [
+                    "player",
+                    "normalized_player_name",
+                    "player_match_key",
+                    "matched_stats_player",
+                    "stats_player_name_before_cleaning",
+                    "stats_player_name_after_cleaning",
+                    "normalized_stats_name",
+                    "stats_match_method",
+                    "stats_match_score",
+                    "games_played",
+                    "at_bats",
+                    "plate_appearances",
+                    "walks",
+                    "strikeouts",
+                    "hit_by_pitch",
+                    "intentional_walks",
+                    "sacrifices",
+                    "stolen_bases",
+                    "caught_stealing",
+                    "ground_into_double_play",
+                    "projected_walks",
+                    "projected_strikeouts",
+                    "projected_hit_by_pitch",
+                    "projected_intentional_walks",
+                    "projected_sacrifices",
+                    "projected_caught_stealing",
+                    "projected_ground_into_double_play",
+                    "secondary_fallback_stats_used",
+                    "secondary_fallback_note",
+                    "projected_fantasy_points",
+                    "projection_source",
+                ]
+                if column in projection_table.columns
+            ]
+            expected_players = [
+                "Heriberto Hernandez",
+                "Tyler Stephenson",
+                "Estury Ruiz",
+                "Shea Langeliers",
+            ]
+            expected_mask = projection_table["player"].isin(expected_players)
+            secondary_debug_table = projection_table[
+                projection_table["projection_source"]
+                .fillna("")
+                .astype(str)
+                .str.contains("Sportsbook|fallback", case=False, na=False)
+                | expected_mask
+            ].copy()
+            if secondary_debug_table.empty:
+                st.info("No projection rows are available for secondary stat diagnostics.")
+            else:
+                st.dataframe(
+                    clean_dataframe_for_streamlit(
+                        secondary_debug_table[secondary_columns]
+                        .sort_values("projected_fantasy_points", ascending=False)
+                        .round(3)
+                    ),
+                    width="stretch",
+                )
 
         with st.expander("Projection Method Notes"):
             st.write(
