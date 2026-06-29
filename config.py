@@ -74,4 +74,5 @@ LEAGUE_RULES = {
     "weekly_sp_start_cap": 5,
     "rp_max_counting_innings": 2,
     "no_add_drop_limit": True,
+    "strong_upgrade_threshold": 1.5,
 }

@@ -19,6 +19,7 @@ env/
 .matplotlib_cache/
 data/cache/*.json
 data/cache/**/*.json
+data/roster_preferences.json
 
 # Operating system files
 .DS_Store

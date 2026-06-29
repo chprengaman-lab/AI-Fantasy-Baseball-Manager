@@ -33,6 +33,9 @@ from services.lineup_optimizer import (
 )
 from services.odds_api import MissingOddsAPIKeyError, OddsAPIError, load_cached_hitter_props
 from services.player_projection_engine import build_player_projection_table
+from services.roster_preferences import (
+    apply_roster_preferences,
+)
 from utils.name_matching import (
     build_player_match_key,
     fuzzy_match_player_name,
@@ -571,10 +574,9 @@ def build_roster_template() -> pd.DataFrame:
                 "eligible_positions": "SS,DH",
                 "roster_spot": "Starter",
                 "player_type": "Hitter",
-                "droppable": "FALSE",
-                "undroppable": "TRUE",
-                "long_term_value": "High",
-                "keeper_status": "Core",
+                "roster_value_status": "Do Not Drop",
+                "streamer_hold_until": "",
+                "streamer_note": "",
                 "notes": "Season-long foundation player",
             },
             {
@@ -582,10 +584,9 @@ def build_roster_template() -> pd.DataFrame:
                 "eligible_positions": "1B,DH",
                 "roster_spot": "Bench",
                 "player_type": "Hitter",
-                "droppable": "TRUE",
-                "undroppable": "FALSE",
-                "long_term_value": "Low",
-                "keeper_status": "Streamer",
+                "roster_value_status": "Streamer",
+                "streamer_hold_until": "",
+                "streamer_note": "Daily matchup stream",
                 "notes": "Daily matchup stream",
             },
             {
@@ -593,10 +594,9 @@ def build_roster_template() -> pd.DataFrame:
                 "eligible_positions": "SP",
                 "roster_spot": "Bench",
                 "player_type": "SP",
-                "droppable": "",
-                "undroppable": "",
-                "long_term_value": "Medium",
-                "keeper_status": "Hold",
+                "roster_value_status": "Drop for Strong Upgrade",
+                "streamer_hold_until": "",
+                "streamer_note": "",
                 "notes": "Pitcher optimization is not built yet",
             },
             {
@@ -604,10 +604,9 @@ def build_roster_template() -> pd.DataFrame:
                 "eligible_positions": "CF",
                 "roster_spot": "IL",
                 "player_type": "Hitter",
-                "droppable": "",
-                "undroppable": "",
-                "long_term_value": "High",
-                "keeper_status": "Hold",
+                "roster_value_status": "Do Not Drop",
+                "streamer_hold_until": "",
+                "streamer_note": "",
                 "notes": "IL players are protected from recommendations",
             },
         ]
@@ -643,6 +642,12 @@ def ensure_pickup_table_columns(table: pd.DataFrame) -> pd.DataFrame:
         "long_term_value",
         "keeper_status",
         "notes",
+        "roster_preference_key",
+        "roster_value_status",
+        "manual_note",
+        "streamer_hold_until",
+        "streamer_note",
+        "roster_preference_updated_at",
     }
 
     for column in expected_columns:
@@ -774,6 +779,12 @@ def merge_projection_data_onto_player_source(
         "long_term_value",
         "keeper_status",
         "notes",
+        "roster_preference_key",
+        "roster_value_status",
+        "manual_note",
+        "streamer_hold_until",
+        "streamer_note",
+        "roster_preference_updated_at",
     }
     projection_columns_to_copy = [
         column for column in output_columns if column not in source_identity_columns
@@ -1041,9 +1052,15 @@ def add_roster_metadata(
             "is_available_today",
             "espn_player_id",
             "player_match_key",
-            "notes",
-            "player_type",
-        ]
+        "notes",
+        "player_type",
+        "roster_preference_key",
+        "roster_value_status",
+        "manual_note",
+        "streamer_hold_until",
+        "streamer_note",
+        "roster_preference_updated_at",
+    ]
         if column in roster_df.columns
     ]
     roster_metadata = roster_df[metadata_columns].drop_duplicates(
@@ -1270,7 +1287,10 @@ def assign_roster_status(
     return projection_table
 
 
-def build_roster_protection_review(roster_df: pd.DataFrame) -> pd.DataFrame:
+def build_roster_protection_review(
+    roster_df: pd.DataFrame,
+    strong_upgrade_threshold: float = 1.5,
+) -> pd.DataFrame:
     """Show exactly why each rostered player is protected or droppable."""
 
     columns = [
@@ -1278,11 +1298,10 @@ def build_roster_protection_review(roster_df: pd.DataFrame) -> pd.DataFrame:
         "eligible_positions",
         "roster_spot",
         "player_type",
-        "droppable",
-        "undroppable",
-        "long_term_value",
-        "keeper_status",
-        "notes",
+        "roster_value_status",
+        "manual_note",
+        "streamer_hold_until",
+        "streamer_note",
         "inferred_drop_status",
         "drop_reason",
     ]
@@ -1294,7 +1313,15 @@ def build_roster_protection_review(roster_df: pd.DataFrame) -> pd.DataFrame:
         if column not in review.columns:
             review[column] = ""
 
-    drop_details = review.apply(get_drop_protection_status, axis=1, result_type="expand")
+    drop_details = review.apply(
+        lambda row: get_drop_protection_status(
+            row,
+            projected_gain=strong_upgrade_threshold,
+            strong_upgrade_threshold=strong_upgrade_threshold,
+        ),
+        axis=1,
+        result_type="expand",
+    )
     review["inferred_drop_status"] = drop_details[0]
     review["drop_reason"] = drop_details[1]
     return review[columns]
@@ -1393,6 +1420,12 @@ DISPLAY_TEXT_COLUMNS = [
     "filter_reason",
     "risk_adjusted_note",
     "move_explanation",
+    "roster_value_status",
+    "manual_note",
+    "drop_roster_value_status",
+    "current_roster_spot",
+    "streamer_hold_until",
+    "streamer_note",
 ]
 
 
@@ -2026,8 +2059,11 @@ def show_split_pickup_recommendations(
             enriched_rows.append(row)
         add_drop = normalize_display_numeric_columns(pd.DataFrame(enriched_rows))
         columns = [
-            "add_player",
             "drop_player",
+            "drop_roster_value_status",
+            "drop_reason",
+            "streamer_hold_until",
+            "add_player",
             "suggested_slot_for_add",
             "projected_gain",
             "current_starting_total",
@@ -2256,12 +2292,15 @@ try:
         "Include stat-fallback-only hitters in recommendations",
         value=False,
     )
-    treat_bench_hitters_as_droppable = st.sidebar.checkbox(
-        "Treat bench hitters as droppable",
-        value=True,
+    strong_upgrade_threshold = st.sidebar.number_input(
+        "Strong upgrade threshold",
+        min_value=0.0,
+        max_value=10.0,
+        value=float(LEAGUE_RULES.get("strong_upgrade_threshold", 1.5)),
+        step=0.1,
         help=(
-            "Development safety setting: healthy bench hitters without Core or "
-            "undroppable protection can be evaluated as drop candidates."
+            "Players marked Drop for Strong Upgrade can only be dropped when "
+            "the projected add/drop gain meets this threshold."
         ),
     )
     show_developer_diagnostics = st.sidebar.checkbox(
@@ -2341,6 +2380,8 @@ try:
         available_players_dataframe,
         espn_cache if selected_data_source == "ESPN League Data" else None,
     )
+    if has_roster_data:
+        roster_dataframe = apply_roster_preferences(roster_dataframe)
 
     roster_summary = None
     if has_roster_data:
@@ -2649,7 +2690,7 @@ try:
             roster_projection_table,
             reduced_available_projection_table,
             active_roster_df=roster_group_table,
-            treat_bench_hitters_as_droppable=treat_bench_hitters_as_droppable,
+            strong_upgrade_threshold=strong_upgrade_threshold,
             progress_callback=show_optimizer_progress,
         )
         profile_counts["add_drop_simulations_executed"] = pickup_recommendations.attrs.get(
@@ -2877,7 +2918,8 @@ try:
             and roster_projection_table.apply(
                 lambda row: is_droppable_player(
                     row,
-                    treat_bench_hitters_as_droppable=treat_bench_hitters_as_droppable,
+                    projected_gain=strong_upgrade_threshold,
+                    strong_upgrade_threshold=strong_upgrade_threshold,
                 ),
                 axis=1,
             ).any()
@@ -2885,7 +2927,7 @@ try:
         if not droppable_exists:
             st.info(
                 "No add/drop moves can be evaluated because no rostered players "
-                "are marked droppable or streamable."
+                "are marked Droppable, Streamer, or Drop for Strong Upgrade."
             )
 
         if pickup_recommendations.empty and multi_add_scenarios.empty:
@@ -3567,15 +3609,30 @@ try:
                 st.info("No match diagnostics are available.")
 
     if has_roster_data and show_roster_protection_review:
-        with st.expander("Roster Protection / Droppable Review", expanded=False):
+        with st.expander("Roster Protection Summary", expanded=False):
             st.write(
-                "The optimizer only suggests dropping players marked droppable "
-                "or streamable. Protected, Core, IL, and unavailable players are not dropped."
+                "Edit these settings on the Roster Settings page."
             )
             review = build_roster_protection_review(
-                roster_group_table if not roster_group_table.empty else roster_dataframe
+                roster_group_table if not roster_group_table.empty else roster_dataframe,
+                strong_upgrade_threshold=strong_upgrade_threshold,
             )
-            st.dataframe(clean_top_pickups_dataframe_for_display(review), width="stretch")
+            review = review[~review.apply(is_player_unavailable, axis=1)].copy()
+            review["current_roster_spot"] = review.get("roster_spot", "")
+            summary_columns = [
+                column
+                for column in [
+                    "player",
+                    "current_roster_spot",
+                    "roster_value_status",
+                    "drop_reason",
+                ]
+                if column in review.columns
+            ]
+            st.dataframe(
+                clean_top_pickups_dataframe_for_display(review[summary_columns]),
+                width="stretch",
+            )
 
     if show_developer_diagnostics:
         if has_roster_data or has_available_data:

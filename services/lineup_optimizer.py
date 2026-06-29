@@ -4,6 +4,7 @@ This module does not build the full optimizer yet. It only defines the position
 eligibility rules the optimizer will need.
 """
 
+from datetime import date, datetime
 from itertools import combinations
 import re
 
@@ -501,23 +502,17 @@ def has_open_active_roster_spot(roster_df: pd.DataFrame) -> bool:
 
 def is_droppable_player(
     player_row,
-    treat_bench_hitters_as_droppable: bool = True,
+    projected_gain: float | None = None,
+    strong_upgrade_threshold: float | None = None,
+    today: date | None = None,
 ) -> bool:
-    """Return True when a roster player can safely be dropped.
-
-    Rules:
-    - If undroppable is true, never drop.
-    - IL players are never dropped by this hitter pickup evaluator.
-    - Core keepers are never dropped.
-    - If droppable is true, allow the drop.
-    - High long-term value players need droppable=TRUE before they can be dropped.
-    - Streamers and Drop Candidates can be dropped when not IL or undroppable.
-    - If droppable is blank or missing, protect the player by default.
-    """
+    """Return True when a roster player can be dropped for this move."""
 
     drop_status, _ = get_drop_protection_status(
         player_row,
-        treat_bench_hitters_as_droppable=treat_bench_hitters_as_droppable,
+        projected_gain=projected_gain,
+        strong_upgrade_threshold=strong_upgrade_threshold,
+        today=today,
     )
 
     return drop_status == "Droppable"
@@ -532,9 +527,82 @@ def _clean_roster_label(value) -> str:
     return re.sub(r"\s+", " ", value.strip()).upper()
 
 
+def _parse_optional_date(value) -> date | None:
+    """Parse an optional YYYY-MM-DD hold date."""
+
+    if value is None or pd.isna(value):
+        return None
+
+    value_text = str(value).strip()
+    if not value_text:
+        return None
+
+    try:
+        return datetime.fromisoformat(value_text).date()
+    except ValueError:
+        return None
+
+
+def _get_roster_value_status(player_row) -> str:
+    """Read the current four-status roster value setting."""
+
+    status = _clean_roster_label(player_row.get("roster_value_status", ""))
+    if status in {
+        "DO NOT DROP",
+        "DROP FOR STRONG UPGRADE",
+        "DROPPABLE",
+        "STREAMER",
+    }:
+        return status
+
+    # Saved old statuses should already be migrated, but this defensive mapping
+    # keeps the optimizer safe if a stale CSV or JSON value reaches it.
+    if status == "CORE":
+        return "DO NOT DROP"
+    if status == "NORMAL":
+        return "DROP FOR STRONG UPGRADE"
+    if status == "DROP CANDIDATE":
+        return "DROPPABLE"
+
+    return "DROP FOR STRONG UPGRADE"
+
+
+def _streamer_hold_is_active(player_row, today: date | None = None) -> tuple[bool, str]:
+    """Return whether a streamer is protected by a hold-through date."""
+
+    hold_until = _parse_optional_date(player_row.get("streamer_hold_until", ""))
+    if hold_until is None:
+        return False, ""
+
+    selected_today = today or date.today()
+    return selected_today <= hold_until, hold_until.isoformat()
+
+
+def is_potential_drop_candidate(player_row, today: date | None = None) -> bool:
+    """Return True when a player can be considered in add/drop simulations."""
+
+    if _is_truthy(player_row.get("undroppable", "")):
+        return False
+
+    if is_il_player(player_row) or is_player_unavailable(player_row):
+        return False
+
+    status = _get_roster_value_status(player_row)
+    if status == "DO NOT DROP":
+        return False
+
+    if status == "STREAMER":
+        hold_active, _ = _streamer_hold_is_active(player_row, today=today)
+        return not hold_active
+
+    return status in {"DROPPABLE", "DROP FOR STRONG UPGRADE"}
+
+
 def get_drop_protection_status(
     player_row,
-    treat_bench_hitters_as_droppable: bool = True,
+    projected_gain: float | None = None,
+    strong_upgrade_threshold: float | None = None,
+    today: date | None = None,
 ) -> tuple[str, str]:
     """Explain whether a roster player can be dropped.
 
@@ -544,68 +612,54 @@ def get_drop_protection_status(
     """
 
     if _is_truthy(player_row.get("undroppable", "")):
-        return "Undroppable", "Marked undroppable in roster CSV"
+        return "Undroppable", "Protected: Do Not Drop"
 
-    if is_il_player(player_row):
-        return "IL - Do Not Drop", "Player is on IL and should not be dropped"
+    if is_il_player(player_row) or is_player_unavailable(player_row):
+        return "IL - Do Not Drop", "Protected: IL/unavailable"
 
-    keeper_status = _clean_roster_label(player_row.get("keeper_status", ""))
-    long_term_value = _clean_roster_label(player_row.get("long_term_value", ""))
-    roster_spot = normalize_position(player_row.get("roster_spot", ""))
+    status = _get_roster_value_status(player_row)
+    threshold = (
+        LEAGUE_RULES.get("strong_upgrade_threshold", 1.5)
+        if strong_upgrade_threshold is None
+        else strong_upgrade_threshold
+    )
 
-    if keeper_status == "CORE":
-        return "Undroppable", "Keeper status is Core"
+    if status == "DO NOT DROP":
+        return "Undroppable", "Protected: Do Not Drop"
 
-    if _is_truthy(player_row.get("droppable", "")):
-        return "Droppable", "Marked droppable in roster CSV"
+    if status == "DROPPABLE":
+        return "Droppable", "Allowed: Droppable"
 
-    if is_player_unavailable(player_row):
-        return (
-            "Protected by Default",
-            "Player is unavailable or injured and is only droppable when explicitly marked droppable",
-        )
+    if status == "STREAMER":
+        hold_active, hold_until = _streamer_hold_is_active(player_row, today=today)
+        if hold_active:
+            return "Protected by Default", f"Protected streamer until {hold_until}"
+        return "Droppable", "Allowed: Streamer hold expired"
 
-    if long_term_value == "HIGH":
-        return (
-            "Protected by Default",
-            "High long-term value player needs droppable TRUE before app suggests a drop",
-        )
-
-    if keeper_status in {"DROP CANDIDATE", "STREAMER"}:
-        return "Droppable", f"Keeper status is {player_row.get('keeper_status')}"
-
-    if (
-        treat_bench_hitters_as_droppable
-        and
-        infer_player_type(player_row) == "HITTER"
-        and roster_spot in {"BE", "BENCH"}
-        and long_term_value in {"", "LOW", "MEDIUM"}
-    ):
-        return (
-            "Droppable",
-            "Bench hitter treated as droppable by safety setting and no explicit protection",
-        )
+    if status == "DROP FOR STRONG UPGRADE":
+        if projected_gain is not None and projected_gain >= threshold:
+            return "Droppable", "Allowed: Strong upgrade threshold met"
+        return "Protected by Default", "Blocked: Strong upgrade threshold not met"
 
     return (
         "Protected by Default",
-        "No droppable flag provided, so app protects this player by default",
+        "Blocked: Strong upgrade threshold not met",
     )
 
 
 def get_drop_risk(player_row) -> str:
     """Return a plain risk label for a proposed dropped player."""
 
-    keeper_status = _clean_roster_label(player_row.get("keeper_status", ""))
-    long_term_value = _clean_roster_label(player_row.get("long_term_value", ""))
+    roster_value_status = _get_roster_value_status(player_row)
 
-    if long_term_value == "HIGH" or keeper_status == "CORE":
+    if roster_value_status == "DO NOT DROP":
         return "High"
 
-    if long_term_value == "MEDIUM" or keeper_status == "HOLD":
-        return "Medium"
-
-    if long_term_value == "LOW" or keeper_status in {"DROP CANDIDATE", "STREAMER"}:
+    if roster_value_status in {"DROPPABLE", "STREAMER"}:
         return "Low"
+
+    if roster_value_status == "DROP FOR STRONG UPGRADE":
+        return "Medium"
 
     return ""
 
@@ -1076,7 +1130,7 @@ def evaluate_single_hitter_pickups(
     roster_df: pd.DataFrame,
     available_df: pd.DataFrame,
     active_roster_df: pd.DataFrame | None = None,
-    treat_bench_hitters_as_droppable: bool = True,
+    strong_upgrade_threshold: float | None = None,
     progress_callback=None,
 ) -> pd.DataFrame:
     """Evaluate one hitter pickup move at a time.
@@ -1107,6 +1161,8 @@ def evaluate_single_hitter_pickups(
         "drop_projection_confidence",
         "drop_long_term_value",
         "drop_keeper_status",
+        "drop_roster_value_status",
+        "streamer_hold_until",
         "drop_risk",
         "drop_reason",
         "impact_roster_slot",
@@ -1203,6 +1259,8 @@ def evaluate_single_hitter_pickups(
                         "drop_projection_confidence": "",
                         "drop_long_term_value": "",
                         "drop_keeper_status": "",
+                        "drop_roster_value_status": "",
+                        "streamer_hold_until": "",
                         "drop_risk": "",
                         "drop_reason": "",
                         "impact_roster_slot": primary_change.get("roster_slot", ""),
@@ -1230,12 +1288,10 @@ def evaluate_single_hitter_pickups(
     # Add/drop moves are still useful when safe droppable players exist. Even
     # when add-only moves are available, this keeps the page from hiding better
     # options or going blank when the active roster is full.
+    today = date.today()
     droppable_roster_df = roster_df[
         roster_df.apply(
-            lambda row: is_droppable_player(
-                row,
-                treat_bench_hitters_as_droppable=treat_bench_hitters_as_droppable,
-            ),
+            lambda row: is_potential_drop_candidate(row, today=today),
             axis=1,
         )
     ].copy()
@@ -1255,10 +1311,6 @@ def evaluate_single_hitter_pickups(
                     }
                 )
 
-            drop_status, drop_reason = get_drop_protection_status(
-                drop_player,
-                treat_bench_hitters_as_droppable=treat_bench_hitters_as_droppable,
-            )
             roster_without_drop = roster_df[
                 roster_df["player"] != drop_player["player"]
             ].copy()
@@ -1273,6 +1325,15 @@ def evaluate_single_hitter_pickups(
             new_lineup_df, _, _ = optimize_hitter_lineup(roster_with_add)
             new_starting_total = _get_starting_total(new_lineup_df)
             projected_gain = new_starting_total - current_starting_total
+            drop_status, drop_reason = get_drop_protection_status(
+                drop_player,
+                projected_gain=projected_gain,
+                strong_upgrade_threshold=strong_upgrade_threshold,
+                today=today,
+            )
+            if drop_status != "Droppable":
+                continue
+
             lineup_changes = compare_lineups(current_lineup_df, new_lineup_df)
             primary_change = (
                 lineup_changes.sort_values(
@@ -1323,6 +1384,14 @@ def evaluate_single_hitter_pickups(
                         ),
                         "drop_keeper_status": drop_player.get(
                             "keeper_status",
+                            "",
+                        ),
+                        "drop_roster_value_status": drop_player.get(
+                            "roster_value_status",
+                            "",
+                        ),
+                        "streamer_hold_until": drop_player.get(
+                            "streamer_hold_until",
                             "",
                         ),
                         "drop_risk": get_drop_risk(drop_player),
